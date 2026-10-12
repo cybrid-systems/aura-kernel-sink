@@ -1,0 +1,28 @@
+; lib/harness.aura — run one sink attempt on a fixture candidate.
+; Shared by scripts/mvp.aura and tests/test_loop*.aura.
+
+(export harness:attempt harness:row)
+
+(require "fixture" all:)
+(require "sink_plan" all:)
+(require "loop" all:)
+
+(define (harness:row name)
+  (let find ((rows (fixture:candidates)))
+    (cond ((null? rows) #f)
+          ((string=? (car (car rows)) name) (car rows))
+          (else (find (cdr rows))))))
+
+; variant: "good" "wrong" "slow" "missing" (see fixture:plan)
+; min-speedup: usually (sink-min-speedup) from the workspace.
+(define (harness:attempt plant name variant min-speedup)
+  (let ((plan (fixture:plan name variant))
+        (row (harness:row name)))
+    (display "-- attempt ") (display name) (display " / ") (display variant) (newline)
+    (sink-plan:print plan)
+    (let ((r (loop:sink-one plan plant (fixture:probe name) (fixture:cases name)
+                            (car (cdr (cdr (cdr (cdr row)))))
+                            (car (cdr (cdr (cdr (cdr (cdr row))))))
+                            min-speedup)))
+      (loop:print r)
+      r)))

@@ -1,0 +1,119 @@
+; lib/fixture.aura — the toy workload the MVP sinks.
+;
+; The workspace (set-code + eval-current) holds three things:
+;   1. data-plane candidates: hot-sum-sq (hot numeric loop), cold-add
+;      (trivial), label-of (returns strings, not sinkable through c-func Int)
+;   2. one kernel slot per sinkable candidate: sink-kernel-<name>, initially 0;
+;      a sink rebinds it to (c-func lib "symbol" "sig")
+;   3. the control-plane policy, hot-updatable with mutate:rebind:
+;      (sink-policy observed-calls ms-per-call numeric?) and (sink-min-speedup)
+;
+; observed-calls is a hard-coded "profile" (Aura has no per-define runtime call
+; counter yet, see IMPROVEMENTS.md); ms-per-call is measured; static call
+; sites come from (query:calls name).
+
+(export fixture:workspace-code
+        fixture:aura-body
+        fixture:candidates
+        fixture:probe
+        fixture:cases
+        fixture:root
+        fixture:so
+        fixture:plan
+        fixture:policy-body)
+
+(require "sink_plan" all:)
+
+(define (fixture:aura-body name)
+  (cond
+    ((string=? name "hot-sum-sq")
+     "(lambda (n) (let loop ((i 0) (s 0)) (if (< i n) (loop (+ i 1) (+ s (* i i))) s)))")
+    ((string=? name "cold-add") "(lambda (a b) (+ a b))")
+    ((string=? name "label-of") "(lambda (n) (if (> n 0) \"pos\" \"non-pos\"))")
+    (else "")))
+
+;; Policy: sink when the estimated time share is large (calls x ms >= budget-ms)
+;; AND one call costs more than an FFI round trip (ms-per-call >= floor-us us),
+;; so a trivial body like cold-add is not worth a kernel however often it runs.
+;; Integers only: float literals inside workspace procedure bodies read back
+;; as 0 on the pinned tip (aura#4475).
+(define (fixture:policy-body budget-ms floor-us)
+  (string-append "(lambda (calls ms-per-call numeric?) (and numeric? (>= (* calls ms-per-call) "
+                 (number->string budget-ms) ") (>= (* 1000 ms-per-call) " (number->string floor-us) ")))"))
+
+(define (fixture:policy-define budget-ms floor-us)
+  (string-append "(define sink-policy " (fixture:policy-body budget-ms floor-us) ")\n"))
+
+(define (fixture:workspace-code)
+  (string-append
+   "(define sink-kernel-hot-sum-sq 0)\n"
+   "(define sink-kernel-cold-add 0)\n"
+   "(define hot-sum-sq " (fixture:aura-body "hot-sum-sq") ")\n"
+   "(define cold-add " (fixture:aura-body "cold-add") ")\n"
+   "(define label-of " (fixture:aura-body "label-of") ")\n"
+   "(define (driver n) (+ (hot-sum-sq n) (hot-sum-sq (+ n 1)) (cold-add n 1)))\n"
+   (fixture:policy-define 50 50)
+   "(define (sink-min-speedup) 2)\n"))
+
+; Candidate rows: (name arity numeric? observed-calls bench-arg bench-reps)
+(define (fixture:candidates)
+  (list (list "hot-sum-sq" 1 #t 400 5000 60)
+        (list "cold-add" 2 #t 5000 7 2000)
+        (list "label-of" 1 #f 300 5 2000)))
+
+; Unary probes. Each looks the workspace name up at call time, so after a
+; mutate:rebind the probe calls the new binding.
+(define (fixture:probe name)
+  (cond
+    ((string=? name "hot-sum-sq") (lambda (x) (hot-sum-sq x)))
+    ((string=? name "cold-add") (lambda (x) (cold-add x 1)))
+    ((string=? name "label-of") (lambda (x) (label-of x)))
+    (else (lambda (x) x))))
+
+; Correctness cases (results stay well inside the fixnum range).
+(define (fixture:cases name)
+  (cond
+    ((string=? name "hot-sum-sq") (list 0 1 2 3 10 100 1000 4999 20000))
+    ((string=? name "cold-add") (list -5 0 1 41 1000000))
+    (else (list 0 1 5))))
+
+; Repo root: SINK_ROOT if set, else the current directory (scripts cd there).
+(define (fixture:root)
+  (let ((r (getenv "SINK_ROOT")))
+    (if (and (string? r) (> (string-length r) 0)) r ".")))
+
+(define (fixture:so base)
+  (string-append (fixture:root) "/build/kernels/lib" base ".so"))
+
+; FakePlant stand-ins (Aura bodies bound into the kernel slot instead of C).
+;   good   closed form n(n-1)(2n-1)/6, really faster than the loop
+;   wrong  off by one
+;   slow   correct but loops four times
+(define (fixture-fake name variant)
+  (cond
+    ((string=? name "cold-add") "(lambda (a b) (+ b a))")
+    ((string=? variant "good") "(lambda (n) (if (< n 1) 0 (quotient (* n (- n 1) (- (* 2 n) 1)) 6)))")
+    ((string=? variant "wrong") "(lambda (n) (if (< n 1) 1 (+ 1 (quotient (* n (- n 1) (- (* 2 n) 1)) 6))))")
+    ((string=? variant "slow")
+     "(lambda (n) (let rep ((k 0) (r 0)) (if (< k 4) (rep (+ k 1) (let loop ((i 0) (s 0)) (if (< i n) (loop (+ i 1) (+ s (* i i))) s))) r)))")
+    (else "")))
+
+; Plans used by the demo and tests. variant: "good" "wrong" "slow" "missing"
+; for hot-sum-sq; cold-add always uses example_add.
+(define (fixture:plan name variant)
+  (cond
+    ((string=? name "cold-add")
+     (sink-plan:make "cold-add" (fixture:so "example_add") "sink_add" 2
+                     (fixture:aura-body "cold-add") (fixture-fake "cold-add" "good")))
+    ((string=? variant "wrong")
+     (sink-plan:make name (fixture:so "bad_wrong") "sink_sum_sq" 1
+                     (fixture:aura-body name) (fixture-fake name "wrong")))
+    ((string=? variant "slow")
+     (sink-plan:make name (fixture:so "bad_slow") "sink_sum_sq" 1
+                     (fixture:aura-body name) (fixture-fake name "slow")))
+    ((string=? variant "missing")
+     (sink-plan:make name (fixture:so "does_not_exist") "sink_sum_sq" 1
+                     (fixture:aura-body name) ""))
+    (else
+     (sink-plan:make name (fixture:so "sum_sq") "sink_sum_sq" 1
+                     (fixture:aura-body name) (fixture-fake name "good")))))

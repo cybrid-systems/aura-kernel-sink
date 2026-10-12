@@ -1,0 +1,86 @@
+; lib/sink_plan.aura — step 2: turn a selected function into a sink plan.
+;
+; A plan says which kernel replaces which define and how:
+;   slot     workspace define that holds the C procedure: sink-kernel-<name>
+;   so       kernel shared object (built by kernels/build.sh)
+;   symbol   exported C symbol
+;   sig      c-func signature, Int-only for the MVP: "(Int Int) -> Int"
+;   wrapper  new body for <name>: a thin call through the slot
+;   fake     Aura stand-in body used by the FakePlant (no .so involved)
+;
+; Plan list: (name slot so symbol sig arity aura-body wrapper fake)
+
+(export sink-plan:make
+        sink-plan:name
+        sink-plan:slot
+        sink-plan:so
+        sink-plan:symbol
+        sink-plan:sig
+        sink-plan:arity
+        sink-plan:aura-body
+        sink-plan:wrapper
+        sink-plan:fake
+        sink-plan:bind-body
+        sink-plan:steps
+        sink-plan:print)
+
+(define (sink-plan-nth lst k)
+  (if (= k 0) (car lst) (sink-plan-nth (cdr lst) (- k 1))))
+
+(define (sink-plan-args arity)
+  (let loop ((i 0) (acc ""))
+    (if (< i arity)
+        (loop (+ i 1)
+              (string-append acc (if (= i 0) "" " ") "a" (number->string i)))
+        acc)))
+
+(define (sink-plan-sig arity)
+  (let loop ((i 0) (acc ""))
+    (if (< i arity)
+        (loop (+ i 1) (string-append acc (if (= i 0) "" " ") "Int"))
+        (string-append "(" acc ") -> Int"))))
+
+(define (sink-plan:make name so symbol arity aura-body fake)
+  (let ((slot (string-append "sink-kernel-" name))
+        (args (sink-plan-args arity)))
+    (list name slot so symbol (sink-plan-sig arity) arity aura-body
+          (string-append "(lambda (" args ") (" slot " " args "))")
+          fake)))
+
+(define (sink-plan:name p) (sink-plan-nth p 0))
+(define (sink-plan:slot p) (sink-plan-nth p 1))
+(define (sink-plan:so p) (sink-plan-nth p 2))
+(define (sink-plan:symbol p) (sink-plan-nth p 3))
+(define (sink-plan:sig p) (sink-plan-nth p 4))
+(define (sink-plan:arity p) (sink-plan-nth p 5))
+(define (sink-plan:aura-body p) (sink-plan-nth p 6))
+(define (sink-plan:wrapper p) (sink-plan-nth p 7))
+(define (sink-plan:fake p) (sink-plan-nth p 8))
+
+; Body that binds the slot to the C procedure, evaluated inside the workspace.
+; lib is the c-load handle index.
+(define (sink-plan:bind-body p lib)
+  (string-append "(c-func " (number->string lib) " \"" (sink-plan:symbol p) "\" \""
+                 (sink-plan:sig p) "\")"))
+
+; The exact primitive sequence loop.aura runs for this plan (documentation and
+; trace output; nothing here is executed).
+(define (sink-plan:steps p)
+  (list
+   (string-append "(hot-strategy:register! \"" (sink-plan:name p) "\" <aura-body>)  ; last-good + ast:snapshot")
+   (string-append "(aot:reload \"" (sink-plan:so p) "\" 0)  ; AOT hot-update gate: staging, version probe, epoch bump")
+   (string-append "(c-load \"" (sink-plan:so p) "\") -> lib ; (c-func lib \"" (sink-plan:symbol p)
+                  "\" \"" (sink-plan:sig p) "\") probe")
+   (string-append "(mutate:atomic-batch (list (list \"mutate:rebind\" \"" (sink-plan:slot p)
+                  "\" (c-func lib ...)) (list \"mutate:rebind\" \"" (sink-plan:name p) "\" \""
+                  (sink-plan:wrapper p) "\")))  ; one MutationBoundary")
+   "(eval-current)"
+   "score: golden cases + bench before/after -> accept | reject"
+   (string-append "accept: (hot-strategy:register! \"" (sink-plan:name p) "\" <wrapper>)")
+   "reject: (hot-strategy:heal!)  ; ast:restore pre-sink snapshot + eval-current, then re-check golden"))
+
+(define (sink-plan:print p)
+  (display "  plan ") (display (sink-plan:name p)) (display " -> ")
+  (display (sink-plan:symbol p)) (display " ") (display (sink-plan:sig p))
+  (display " from ") (display (sink-plan:so p)) (newline)
+  (display "    wrapper: ") (display (sink-plan:wrapper p)) (newline))

@@ -1,0 +1,124 @@
+; lib/loop.aura — the closed loop: identify -> plan -> load -> rebind ->
+; eval-current -> score -> accept | heal, all in one process.
+;
+; Control plane (hot-updatable Aura): sink-policy, sink-min-speedup and the
+;   wrapper bodies, changed with mutate:rebind / hot-strategy:swap!.
+; Data plane: the kernel .so, brought in through aot:reload + c-load.
+;
+; Rollback point: hot-strategy:register! records the pre-sink body and takes
+; an ast:snapshot BEFORE anything is mutated. A reject calls
+; hot-strategy:heal! (ast:restore that snapshot + eval-current) and then
+; re-checks the golden cases against the restored Aura body.
+;
+; Result: (name plant verdict reasons speedup t-before t-after rolled-back
+;          rollback-ok stage)
+;   stage  "load" | "bind" | "score" — where the attempt ended
+
+(export loop:sink-one
+        loop:set-atomic-batch!
+        loop:name
+        loop:plant
+        loop:verdict
+        loop:reasons
+        loop:speedup
+        loop:rolled-back?
+        loop:rollback-ok?
+        loop:stage
+        loop:accepted?
+        loop:print)
+
+(require "std/hot-strategy" all:)
+(require "sink_plan" all:)
+(require "score" all:)
+(require "plant" all:)
+
+(define (loop-result plan plant verdict reasons speedup t-before t-after rolled ok stage)
+  (list (sink-plan:name plan) (plant:kind plant) verdict reasons speedup
+        t-before t-after rolled ok stage))
+
+(define (loop-nth lst k) (if (= k 0) (car lst) (loop-nth (cdr lst) (- k 1))))
+(define (loop:name r) (loop-nth r 0))
+(define (loop:plant r) (loop-nth r 1))
+(define (loop:verdict r) (loop-nth r 2))
+(define (loop:reasons r) (loop-nth r 3))
+(define (loop:speedup r) (loop-nth r 4))
+(define (loop:rolled-back? r) (loop-nth r 7))
+(define (loop:rollback-ok? r) (loop-nth r 8))
+(define (loop:stage r) (loop-nth r 9))
+(define (loop:accepted? r) (string=? (loop:verdict r) "accept"))
+
+; heal! and re-check the golden cases on the restored body.
+(define (loop-rollback probe golden)
+  (let ((healed (try (hot-strategy:heal!) (catch (e) #f))))
+    (and healed (= (score:check probe golden) 0))))
+
+;; Bind the kernel slot and swap the wrapper in.
+;; Default: two mutate:rebind calls (slot first, then wrapper), each its own
+;; MutationBoundary; a failure in between is healed by the caller.
+;; (loop:set-atomic-batch! #t) uses ONE mutate:atomic-batch instead. That is
+;; the intended shape, but on the pinned tip a two-op atomic-batch followed by
+;; ast:restore inside one top-level form makes the Soft file runner silently
+;; re-run the whole file (aura#4476; see IMPROVEMENTS.md), so it is off.
+(define *loop-atomic-batch* #f)
+(define (loop:set-atomic-batch! on) (set! *loop-atomic-batch* (if on #t #f)) *loop-atomic-batch*)
+
+(define (loop-bind-and-swap plan plant lib)
+  (let ((bind (list "mutate:rebind" (sink-plan:slot plan)
+                    ((plant:bind-body plant) plan lib) "aura-kernel-sink:bind"))
+        (swap (list "mutate:rebind" (sink-plan:name plan) (sink-plan:wrapper plan)
+                    "aura-kernel-sink:swap")))
+    (try
+      (if *loop-atomic-batch*
+          (mutate:atomic-batch (list bind swap))
+          (let ((b (mutate:rebind (car (cdr bind)) (car (cdr (cdr bind))) (car (cdr (cdr (cdr bind)))))))
+            (if (equal? b #t)
+                (mutate:rebind (car (cdr swap)) (car (cdr (cdr swap))) (car (cdr (cdr (cdr swap)))))
+                b)))
+      (catch (e) e))))
+
+; One sink attempt.
+;   plan          from sink-plan:make
+;   plant         plant:real or plant:fake
+;   probe         unary procedure calling the workspace define by name
+;   cases         correctness inputs
+;   bench-arg/reps  timing input and repetitions
+;   min-speedup   usually (sink-min-speedup) from the workspace
+(define (loop:sink-one plan plant probe cases bench-arg reps min-speedup)
+  (let ((name (sink-plan:name plan))
+        (golden (score:golden probe cases))
+        (t-before (score:bench probe bench-arg reps)))
+    ; Rollback point first: last-good body + ast:snapshot.
+    (hot-strategy:register! name (sink-plan:aura-body plan))
+    (let ((boxed ((plant:load plant) plan)))
+      (if (not boxed)
+          ; Nothing was mutated; no rollback needed.
+          (loop-result plan plant "reject" (list "load-failed") 0.0 t-before 0
+                       #f (= (score:check probe golden) 0) "load")
+          (let ((batch (loop-bind-and-swap plan plant (car boxed))))
+            (if (not (equal? batch #t))
+                (loop-result plan plant "reject" (list "bind-failed") 0.0 t-before 0
+                             #t (loop-rollback probe golden) "bind")
+                (begin
+                  (eval-current)
+                  (let ((s (score:evaluate golden t-before probe bench-arg reps min-speedup)))
+                    (if (score:accept? s)
+                        (begin
+                          ; Promote: the sunk wrapper becomes the new last-good.
+                          (hot-strategy:register! name (sink-plan:wrapper plan))
+                          (loop-result plan plant "accept" (list) (score:speedup s)
+                                       t-before (score:t-after s) #f #t "score"))
+                        (loop-result plan plant "reject" (score:reasons s) (score:speedup s)
+                                     t-before (score:t-after s)
+                                     #t (loop-rollback probe golden) "score"))))))))))
+
+(define (loop:print r)
+  (display "  [") (display (loop:plant r)) (display "] ") (display (loop:name r))
+  (display ": ") (display (loop:verdict r))
+  (display " reasons=") (display (loop:reasons r))
+  (display " speedup=") (display (loop:speedup r))
+  (display " t-before=") (display (loop-nth r 5)) (display "ms")
+  (display " t-after=") (display (loop-nth r 6)) (display "ms")
+  (display " stage=") (display (loop:stage r))
+  (display " rolled-back=") (display (loop:rolled-back? r))
+  (display " rollback-ok=") (display (loop:rollback-ok? r))
+  (newline))

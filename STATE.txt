@@ -1,0 +1,23 @@
+# aura-kernel-sink state (machine-readable, key=value)
+aura_repo=https://github.com/cybrid-systems/aura
+aura_tip=c4fc6cf23af677189339eb99990a766c2bb1a01a  # pinned 2026-10-12
+aura_build=RelWithDebInfo
+aura_face=soft  # AURA_SANDBOX=off AURA_PIPELINE_STRICT=0; default Restricted face cannot load the std prelude on this tip
+
+identify=real        # measured ms/call + query:calls sites; decision = workspace sink-policy (hot-swappable)
+call_profile=fixture # observed-calls hard-coded in lib/fixture.aura; no per-define runtime call counter in Aura yet
+kernel_gen=manual    # kernels/*.c hand-written
+kernel_build=real    # kernels/build.sh -> build/kernels/lib*.so
+aot_reload=real      # (aot:reload so 0) -> #t on Soft; gate only, the kernel is called through c-func
+ffi_bind=real        # c-load + c-func, probed with procedure? before any mutation
+rebind=real          # mutate:rebind slot + wrapper, eval-current
+atomic_batch=off     # implemented (loop:set-atomic-batch! #t), off because of an upstream bug (see IMPROVEMENTS.md)
+score=real           # correctness + determinism + speedup >= (sink-min-speedup)
+rollback=real        # hot-strategy:heal! (ast:restore + eval-current) + golden re-check
+fake_plant=real      # SINK_PLANT=fake runs the same loop with Aura stand-in bodies
+
+tests=tests/test_identify.aura tests/test_score.aura tests/test_loop_real.aura tests/test_loop_fake.aura  # 95 checks
+mvp=scripts/run_mvp.sh  # 7 checks, real and fake plant
+
+aura_issues_filed=4475,4476,4477,4478  # float literal->0 in workspace bodies; atomic-batch file re-run + define unbound; primitive shadow lost after eval-current; cannot-call re-run + silent non-procedure apply
+next=per-define runtime call counter; kernel generator; Float ABI kernels; switch to atomic-batch when fixed; Restricted face with effect:ffi

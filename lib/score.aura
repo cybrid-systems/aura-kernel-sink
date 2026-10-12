@@ -1,0 +1,91 @@
+; lib/score.aura — step 3: multi-dimensional verdict on a sink attempt.
+;
+; Dimensions:
+;   correctness    every golden case matches (a raised error is a mismatch)
+;   determinism    two calls on the bench input agree
+;   speed          speedup = t-before / max(t-after, 1 ms) >= min-speedup
+; Golden values and t-before are captured BEFORE the swap, because after a
+; mutate:rebind the probe calls the new binding.
+;
+; Result: (verdict reasons speedup t-before t-after mismatches score)
+;   verdict  "accept" | "reject"
+;   reasons  list of "wrong-result" "nondeterministic" "too-slow"
+;   score    speedup when correct and deterministic, else 0
+
+(export score:golden
+        score:check
+        score:bench
+        score:evaluate
+        score:verdict
+        score:reasons
+        score:speedup
+        score:t-before
+        score:t-after
+        score:mismatches
+        score:value
+        score:accept?
+        score:print)
+
+(define (score:golden probe cases)
+  (if (null? cases)
+      (list)
+      (cons (cons (car cases) (probe (car cases)))
+            (score:golden probe (cdr cases)))))
+
+; Number of golden cases the probe gets wrong (errors count).
+(define (score:check probe golden)
+  (let loop ((gs golden) (bad 0))
+    (if (null? gs)
+        bad
+        (let ((x (car (car gs)))
+              (want (cdr (car gs))))
+          (let ((got (try (list (probe x)) (catch (e) #f))))
+            (loop (cdr gs)
+                  (if (and got (equal? (car got) want)) bad (+ bad 1))))))))
+
+; Total milliseconds for reps calls of (probe arg).
+(define (score:bench probe arg reps)
+  (let ((t0 (current-time-ms)))
+    (let loop ((i 0))
+      (if (< i reps)
+          (begin (probe arg) (loop (+ i 1)))
+          0))
+    (- (current-time-ms) t0)))
+
+(define (score:evaluate golden t-before probe bench-arg reps min-speedup)
+  (let ((bad (score:check probe golden))
+        (det (try (equal? (probe bench-arg) (probe bench-arg)) (catch (e) #f))))
+    (let ((t-after (if (and (= bad 0) det) (score:bench probe bench-arg reps) 0)))
+      (let ((speedup (if (and (= bad 0) det)
+                         (/ (+ 0.0 t-before) (if (< t-after 1) 1 t-after))
+                         0.0)))
+        (let ((reasons (append (if (> bad 0) (list "wrong-result") (list))
+                               (if det (list) (list "nondeterministic"))
+                               (if (and (= bad 0) det (< speedup min-speedup))
+                                   (list "too-slow")
+                                   (list)))))
+          (list (if (null? reasons) "accept" "reject")
+                reasons
+                speedup
+                t-before
+                t-after
+                bad
+                (if (and (= bad 0) det) speedup 0.0)))))))
+
+(define (score:verdict s) (car s))
+(define (score:reasons s) (car (cdr s)))
+(define (score:speedup s) (car (cdr (cdr s))))
+(define (score:t-before s) (car (cdr (cdr (cdr s)))))
+(define (score:t-after s) (car (cdr (cdr (cdr (cdr s))))))
+(define (score:mismatches s) (car (cdr (cdr (cdr (cdr (cdr s)))))))
+(define (score:value s) (car (cdr (cdr (cdr (cdr (cdr (cdr s))))))))
+(define (score:accept? s) (string=? (score:verdict s) "accept"))
+
+(define (score:print s)
+  (display "    verdict=") (display (score:verdict s))
+  (display " reasons=") (display (score:reasons s))
+  (display " speedup=") (display (score:speedup s))
+  (display " t-before=") (display (score:t-before s)) (display "ms")
+  (display " t-after=") (display (score:t-after s)) (display "ms")
+  (display " mismatches=") (display (score:mismatches s))
+  (newline))

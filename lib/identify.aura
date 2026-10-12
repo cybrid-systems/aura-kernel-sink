@@ -1,0 +1,110 @@
+; lib/identify.aura — step 1 of the closed loop: is a function worth sinking?
+;
+; Signals (all gathered from inside Aura, no external profiler):
+;   observed-calls  call count from a profile (fixture for now)
+;   ms-per-call     measured with current-time-ms around a probe
+;   static-calls    number of call sites, (length (query:calls name))
+;   numeric?        whether the c-func Int ABI can carry the signature
+;
+; The DECISION is not made here. identify:run takes `policy`, a procedure
+; (lambda (observed-calls ms-per-call numeric?) ...) that the caller wires to
+; the workspace define `sink-policy`. Rebinding sink-policy with mutate:rebind
+; or hot-strategy:swap! changes the decision without restarting the process.
+
+(export identify:measure
+        identify:static-calls
+        identify:candidate
+        identify:run
+        identify:selected
+        identify:find
+        identify:name
+        identify:decide?
+        identify:score
+        identify:observed
+        identify:static
+        identify:ms-per-call
+        identify:numeric?
+        identify:print)
+
+; Average milliseconds per call of (probe arg) over reps calls (float).
+(define (identify:measure probe arg reps)
+  (let ((t0 (current-time-ms)))
+    (let loop ((i 0))
+      (if (< i reps)
+          (begin (probe arg) (loop (+ i 1)))
+          0))
+    (/ (+ 0.0 (- (current-time-ms) t0)) reps)))
+
+; Call sites in the workspace AST. query:calls returns a list of node ids,
+; or an error value when there is no workspace.
+(define (identify:static-calls name)
+  (let ((r (try (query:calls name) (catch (e) #f))))
+    (if (list? r) (length r) 0)))
+
+; Record: (name decide? score observed static ms-per-call numeric?)
+(define (identify:name r) (car r))
+(define (identify:decide? r) (car (cdr r)))
+(define (identify:score r) (car (cdr (cdr r))))
+(define (identify:observed r) (car (cdr (cdr (cdr r)))))
+(define (identify:static r) (car (cdr (cdr (cdr (cdr r))))))
+(define (identify:ms-per-call r) (car (cdr (cdr (cdr (cdr (cdr r)))))))
+(define (identify:numeric? r) (car (cdr (cdr (cdr (cdr (cdr (cdr r))))))))
+
+; row: (name arity numeric? observed-calls bench-arg bench-reps)
+; Score = estimated milliseconds spent in the function (observed * ms/call)
+; plus one per static call site. The score only ranks; policy decides.
+(define (identify:candidate row probe policy)
+  (let ((name (car row))
+        (numeric? (car (cdr (cdr row))))
+        (observed (car (cdr (cdr (cdr row)))))
+        (arg (car (cdr (cdr (cdr (cdr row))))))
+        (reps (car (cdr (cdr (cdr (cdr (cdr row))))))))
+    (let ((ms (identify:measure probe arg reps))
+          (static (identify:static-calls name)))
+      (let ((score (+ (* observed ms) static))
+            (decide (if (policy observed ms numeric?) #t #f)))
+        (list name decide score observed static ms numeric?)))))
+
+(define (identify-insert r sorted)
+  (cond
+    ((null? sorted) (list r))
+    ((>= (identify:score r) (identify:score (car sorted))) (cons r sorted))
+    (else (cons (car sorted) (identify-insert r (cdr sorted))))))
+
+; rows: fixture rows; probe-of: name -> unary probe; policy: see above.
+; Returns records sorted by score, highest first.
+(define (identify:run rows probe-of policy)
+  (let loop ((rs rows) (acc (list)))
+    (if (null? rs)
+        acc
+        (loop (cdr rs)
+              (identify-insert (identify:candidate (car rs) (probe-of (car (car rs))) policy)
+                               acc)))))
+
+; Names the policy selected, in score order.
+(define (identify:selected records)
+  (cond
+    ((null? records) (list))
+    ((identify:decide? (car records))
+     (cons (identify:name (car records)) (identify:selected (cdr records))))
+    (else (identify:selected (cdr records)))))
+
+(define (identify:find records name)
+  (cond
+    ((null? records) #f)
+    ((string=? (identify:name (car records)) name) (car records))
+    (else (identify:find (cdr records) name))))
+
+(define (identify:print records)
+  (if (null? records)
+      #t
+      (let ((r (car records)))
+        (display "  ") (display (identify:name r))
+        (display "  sink=") (display (identify:decide? r))
+        (display "  score=") (display (identify:score r))
+        (display "  calls=") (display (identify:observed r))
+        (display "  sites=") (display (identify:static r))
+        (display "  ms/call=") (display (identify:ms-per-call r))
+        (display "  numeric=") (display (identify:numeric? r))
+        (newline)
+        (identify:print (cdr records)))))

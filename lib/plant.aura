@@ -1,0 +1,50 @@
+; lib/plant.aura — the data-plane side of a sink, behind one interface.
+;
+; plant = (kind load bind-body)
+;   load       (plan) -> (list lib) or #f. Runs before any mutation. The handle
+;              is boxed because Aura treats 0 as false and the first c-load
+;              handle is 0.
+;   bind-body  (plan lib) -> code string the kernel slot is rebound to.
+;
+; RealPlant: the AOT hot-update path.
+;   (aot:reload so 0)  staging dlopen, aot_emit_version probe, func-table
+;                      epoch bump, AotReloadConsistencyProof stamp; #f on
+;                      dlopen / version / region / defuse failure
+;   (c-load so)        FFI handle for the same .so (std/ffi)
+;   (c-func lib sym sig)  probe that the symbol resolves BEFORE mutating,
+;                      because c-func returns 0 (not an error) on a missing
+;                      symbol and c-load returns 0 on failure too.
+; FakePlant: no .so. Binds the slot to an Aura stand-in body from the plan, so
+;   the control-plane loop (rebind, score, accept/heal) runs end to end on any
+;   build, including one where aot:reload / c-load are unavailable.
+
+(export plant:real
+        plant:fake
+        plant:kind
+        plant:load
+        plant:bind-body)
+
+(require "std/ffi" all:)
+(require "sink_plan" all:)
+
+(define (plant:kind p) (car p))
+(define (plant:load p) (car (cdr p)))
+(define (plant:bind-body p) (car (cdr (cdr p))))
+
+(define (plant:real)
+  (list "real"
+        (lambda (plan)
+          (let ((so (sink-plan:so plan)))
+            (if (equal? (try (aot:reload so 0) (catch (e) #f)) #t)
+                (let ((lib (c-load so)))
+                  (let ((f (c-func lib (sink-plan:symbol plan) (sink-plan:sig plan))))
+                    (if (procedure? f) (list lib) #f)))
+                #f)))
+        (lambda (plan lib) (sink-plan:bind-body plan lib))))
+
+(define (plant:fake)
+  (list "fake"
+        (lambda (plan)
+          (let ((body (sink-plan:fake plan)))
+            (if (and (string? body) (> (string-length body) 0)) (list -1) #f)))
+        (lambda (plan lib) (sink-plan:fake plan))))

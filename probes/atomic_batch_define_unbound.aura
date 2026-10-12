@@ -1,0 +1,10 @@
+; (define x (mutate:atomic-batch ...)) applies the batch but leaves x unbound.
+; Run: AURA_SANDBOX=off AURA_PIPELINE_STRICT=0 aura probes/atomic_batch_define_unbound.aura
+; Expected: (1 3 3) / #t    Pinned tip: (1 3 3) / error: unbound variable: r2
+(set-code "(define (f x) (+ x 1))")
+(eval-current)
+(define before 1)
+(define r2 (mutate:atomic-batch (list (list "mutate:rebind" "f" "(lambda (x) (+ x 2))" "b"))))
+(define after 3)
+(display (list before after (f 1))) (newline)
+(display r2) (newline)

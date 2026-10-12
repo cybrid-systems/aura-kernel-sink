@@ -1,0 +1,74 @@
+; scripts/mvp.aura — the MVP closed loop in one process (run via run_mvp.sh).
+(require "expect" all:)
+(require "fixture" all:)
+(require "identify" all:)
+(require "sink_plan" all:)
+(require "plant" all:)
+(require "score" all:)
+(require "loop" all:)
+(require "harness" all:)
+(require "std/hot-strategy" all:)
+(display "RUN-ONCE") (newline)  ; run_tests.sh fails if this prints twice (silent file re-run)
+
+(define plant-kind (let ((k (getenv "SINK_PLANT"))) (if (and (string? k) (string=? k "fake")) "fake" "real")))
+(define plant (if (string=? plant-kind "fake") (plant:fake) (plant:real)))
+
+(display "== aura-kernel-sink MVP (plant=") (display plant-kind) (display ")") (newline)
+
+; 0. Seed the workspace: candidates, kernel slots, control-plane policy.
+(set-code (fixture:workspace-code))
+(eval-current)
+
+; 1. Identify. The policy is the workspace define sink-policy.
+(define policy (lambda (calls ms numeric) (sink-policy calls ms numeric)))
+(display "-- 1. identify (policy = workspace sink-policy)") (newline)
+(define records (identify:run (fixture:candidates) fixture:probe policy))
+(identify:print records)
+(define selected (identify:selected records))
+(display "  selected: ") (display selected) (newline)
+
+; 1b. Hot-update the decision rule itself, re-identify, then restore it.
+(display "-- 1b. hot-swap sink-policy (budget 50 ms -> 1e9 ms), re-identify, restore") (newline)
+(mutate:rebind "sink-policy" (fixture:policy-body 1000000000 50) "raise budget")
+(eval-current)
+(display "  selected: ") (display (identify:selected (identify:run (fixture:candidates) fixture:probe policy))) (newline)
+(mutate:rebind "sink-policy" (fixture:policy-body 50 50) "restore budget")
+(eval-current)
+
+; 2-3. Sink attempts on hot-sum-sq: wrong kernel, slow kernel, missing .so,
+; then the good kernel. Each one runs the full loop; rejects heal back.
+(define (attempt name variant) (harness:attempt plant name variant (sink-min-speedup)))
+
+(display "-- 2. primitive sequence per attempt") (newline)
+(define (print-steps steps) (if (null? steps) #t (begin (display "    ") (display (car steps)) (newline) (print-steps (cdr steps)))))
+(print-steps (sink-plan:steps (fixture:plan "hot-sum-sq" "good")))
+
+;; Results are stored with set! on purpose: on the pinned tip a top-level
+;; (define x (f)) where f runs mutate:atomic-batch leaves x unbound (filed
+;; aura#4476; see IMPROVEMENTS.md).
+(define r-wrong #f)
+(define r-slow #f)
+(define r-missing #f)
+(define r-add #f)
+(define r-good #f)
+(set! r-wrong (attempt "hot-sum-sq" "wrong"))
+(set! r-slow (attempt "hot-sum-sq" "slow"))
+(set! r-missing (if (string=? plant-kind "real") (attempt "hot-sum-sq" "missing") #f))
+(set! r-add (attempt "cold-add" "good"))
+(set! r-good (attempt "hot-sum-sq" "good"))
+
+(display "-- 4. final state") (newline)
+(display "  (hot-sum-sq 100) = ") (display (hot-sum-sq 100)) (newline)
+(display "  (cold-add 2 3) = ") (display (cold-add 2 3)) (newline)
+(display "  hot-strategy version = ") (display (hot-strategy:version))
+(display ", active = ") (display (hot-strategy:active-name)) (newline)
+(display "  query:aot-reload-primitive-stats = ") (display (engine:metrics "query:aot-reload-primitive-stats")) (newline)
+
+(expect "identify selects hot-sum-sq only" (equal? selected (list "hot-sum-sq")))
+(expect "wrong kernel rejected and healed" (and (not (loop:accepted? r-wrong)) (loop:rollback-ok? r-wrong)))
+(expect "slow kernel rejected and healed" (and (not (loop:accepted? r-slow)) (loop:rollback-ok? r-slow)))
+(expect "missing .so rejected before any mutation" (or (not r-missing) (string=? (loop:stage r-missing) "load")))
+(expect "trivial add kernel rejected (not faster)" (and (not (loop:accepted? r-add)) (loop:rollback-ok? r-add)))
+(expect "good kernel accepted" (loop:accepted? r-good))
+(expect "sunk hot-sum-sq still correct" (= (hot-sum-sq 100) 328350))
+(expect-summary)

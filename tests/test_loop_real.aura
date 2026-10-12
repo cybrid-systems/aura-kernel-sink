@@ -1,0 +1,70 @@
+; tests/test_loop_real.aura — the closed loop with the real plant:
+; reject + heal on wrong / slow / not-worth-it kernels, accept the good one,
+; and after an accept a bad attempt heals back to the SUNK version.
+(require "expect" all:)
+(require "fixture" all:)
+(require "plant" all:)
+(require "loop" all:)
+(require "harness" all:)
+(require "std/hot-strategy" all:)
+(display "RUN-ONCE") (newline)  ; run_tests.sh fails if this prints twice (silent file re-run)
+
+(define plant (plant:real))
+(define (has? x lst) (cond ((null? lst) #f) ((equal? (car lst) x) #t) (else (has? x (cdr lst)))))
+
+(set-code (fixture:workspace-code))
+(eval-current)
+(define aura-100 (hot-sum-sq 100))
+(expect "real: seed workspace, (hot-sum-sq 100) = 328350" (= aura-100 328350))
+
+; Results go through set!: a top-level (define x (f)) where f runs
+; mutate:atomic-batch leaves x unbound on the pinned tip (aura#4476).
+(define r #f)
+
+(set! r (harness:attempt plant "hot-sum-sq" "wrong" (sink-min-speedup)))
+(expect "real wrong: rejected" (not (loop:accepted? r)))
+(expect "real wrong: reason wrong-result" (has? "wrong-result" (loop:reasons r)))
+(expect "real wrong: ended at score" (string=? (loop:stage r) "score"))
+(expect "real wrong: rolled back and golden re-checked" (and (loop:rolled-back? r) (loop:rollback-ok? r)))
+(expect "real wrong: kernel slot restored to 0" (equal? sink-kernel-hot-sum-sq 0))
+(expect "real wrong: Aura body answers again" (= (hot-sum-sq 100) 328350))
+
+(set! r (harness:attempt plant "hot-sum-sq" "slow" (sink-min-speedup)))
+(expect "real slow: rejected" (not (loop:accepted? r)))
+(expect "real slow: reason too-slow" (has? "too-slow" (loop:reasons r)))
+(expect "real slow: rolled back and golden re-checked" (and (loop:rolled-back? r) (loop:rollback-ok? r)))
+(expect "real slow: kernel slot restored to 0" (equal? sink-kernel-hot-sum-sq 0))
+
+(set! r (harness:attempt plant "hot-sum-sq" "missing" (sink-min-speedup)))
+(expect "real missing: rejected at load" (and (not (loop:accepted? r)) (string=? (loop:stage r) "load")))
+(expect "real missing: reason load-failed" (has? "load-failed" (loop:reasons r)))
+(expect "real missing: nothing mutated, nothing rolled back" (not (loop:rolled-back? r)))
+(expect "real missing: kernel slot still 0" (equal? sink-kernel-hot-sum-sq 0))
+
+(set! r (harness:attempt plant "cold-add" "good" (sink-min-speedup)))
+(expect "real cold-add: trivial kernel rejected" (not (loop:accepted? r)))
+(expect "real cold-add: reason too-slow" (has? "too-slow" (loop:reasons r)))
+(expect "real cold-add: slot restored, (cold-add 2 3) = 5" (and (equal? sink-kernel-cold-add 0) (= (cold-add 2 3) 5)))
+
+(set! r (harness:attempt plant "hot-sum-sq" "good" (sink-min-speedup)))
+(expect "real good: accepted" (loop:accepted? r))
+(expect "real good: speedup >= (sink-min-speedup)" (>= (loop:speedup r) (sink-min-speedup)))
+(expect "real good: not rolled back" (not (loop:rolled-back? r)))
+(expect "real good: kernel slot holds a procedure" (procedure? sink-kernel-hot-sum-sq))
+(expect "real good: sunk hot-sum-sq is correct" (= (hot-sum-sq 100) 328350))
+(expect "real good: sunk version is the new last-good" (string=? (hot-strategy:active-name) "hot-sum-sq"))
+
+; A bad attempt after the accept must heal back to the sunk version, not to
+; the original Aura body.
+(set! r (harness:attempt plant "hot-sum-sq" "wrong" (sink-min-speedup)))
+(expect "real re-wrong: rejected" (not (loop:accepted? r)))
+(expect "real re-wrong: healed and golden re-checked" (loop:rollback-ok? r))
+(expect "real re-wrong: still sunk (slot is a procedure)" (procedure? sink-kernel-hot-sum-sq))
+(expect "real re-wrong: still correct" (= (hot-sum-sq 4999) 41629177499))
+
+; Control-plane knob: an impossible min-speedup rejects even the good kernel.
+(set! r (harness:attempt plant "hot-sum-sq" "good" 1000000000))
+(expect "real bar: impossible min-speedup rejects good" (has? "too-slow" (loop:reasons r)))
+(expect "real bar: healed to the previous sunk version" (and (loop:rollback-ok? r) (procedure? sink-kernel-hot-sum-sq)))
+
+(expect "checks all passed" (expect-summary))

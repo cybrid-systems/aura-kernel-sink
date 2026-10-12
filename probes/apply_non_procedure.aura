@@ -1,0 +1,7 @@
+; Applying a non-procedure at top level returns the head value silently.
+; Run: AURA_SANDBOX=off AURA_PIPELINE_STRICT=0 aura probes/apply_non_procedure.aura
+; Expected: errors "cannot call"    Pinned tip: prints 5, then s, exit 0
+(display (5 5))
+(newline)
+(display ("s" 1))
+(newline)

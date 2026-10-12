@@ -1,0 +1,17 @@
+; A two-op mutate:atomic-batch followed by ast:restore inside ONE top-level
+; form makes the Soft file runner silently run the whole file again.
+; Run: AURA_SANDBOX=off AURA_PIPELINE_STRICT=0 aura probes/atomic_batch_rerun.aura
+; Expected: start / (end 7 2 0)    Pinned tip prints: start / start / (end 7 2 0)
+(display "start") (newline)
+(set-code "(define k 0)\n(define f (lambda (n) (+ n 1)))")
+(eval-current)
+(define s0 (ast:snapshot "p"))
+(define (go)
+  (mutate:atomic-batch (list (list "mutate:rebind" "k" "(lambda (n) (+ n 10))" "a")
+                             (list "mutate:rebind" "f" "(lambda (a0) (k a0))" "b")))
+  (ast:restore s0)
+  (eval-current)
+  7)
+(define r #f)
+(set! r (go))
+(display (list "end" r (f 1) k)) (newline)

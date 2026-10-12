@@ -1,0 +1,10 @@
+; A runtime "cannot call" error in a top-level form re-runs every earlier form
+; (the unbound-variable trigger of closed #4355 is fixed; this one is not).
+; Run: AURA_SANDBOX=off AURA_PIPELINE_STRICT=0 aura probes/cannot_call_rerun.aura
+; Expected: one / error: cannot call: z    Pinned tip: one / one / error ...
+(display "one")
+(newline)
+(define (f x) (+ x 1))
+(define z 0)
+(display (f (z 1)))
+(newline)

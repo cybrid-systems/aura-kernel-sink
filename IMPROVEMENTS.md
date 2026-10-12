@@ -1,0 +1,71 @@
+# Improvements and findings
+
+Pinned Aura tip: `c4fc6cf23` (RelWithDebInfo, Soft face).
+
+## Aura bugs filed from this repo
+
+Each has a minimal repro in `probes/`.
+
+| issue | what | probe | hit in this repo |
+|---|---|---|---|
+| [#4475](https://github.com/cybrid-systems/aura/issues/4475) | float literals in `set-code` workspace procedure bodies evaluate to `0` | `probes/float_literal_in_workspace_body.aura` | `sink-policy` floor `0.05` became `0`; a trivial function was selected for sinking |
+| [#4476](https://github.com/cybrid-systems/aura/issues/4476) | two-op `mutate:atomic-batch` + `ast:restore` in one top-level form silently re-runs the whole file; `(define x (mutate:atomic-batch …))` leaves `x` unbound | `probes/atomic_batch_rerun.aura`, `probes/atomic_batch_define_unbound.aura` | rejected attempts re-ran every earlier mutation; attempt results were unbound |
+| [#4477](https://github.com/cybrid-systems/aura/issues/4477) | a user define shadowing a primitive (`check`) reverts to the primitive after `eval-current` | `probes/primitive_shadow_after_eval_current.aura` | the PASS/FAIL helper turned into a silent no-op (`0 passed, 0 failed`) |
+| [#4478](https://github.com/cybrid-systems/aura/issues/4478) | runtime `cannot call` re-runs earlier forms (residual of #4355); `(5 5)` / `(z 5)` return a value silently | `probes/cannot_call_rerun.aura`, `probes/apply_non_procedure.aura` | a kernel slot holding `0` (failed `c-func`) re-runs the file or yields `0` |
+
+## Aura API gaps (not filed as bugs)
+
+1. **No per-define runtime call counter.** `query:calls` gives static call
+   sites only. `identify.aura` uses a hard-coded `observed-calls` column. A
+   `query:define-call-stats` (calls, total ns per define, sampled) would let the
+   loop find hotspots by itself.
+2. **`c-load` returns `0` on failure, and `0` is also the first handle.** Aura
+   treats `0` as false, so `(if lib ...)` rejects the first good handle, and a
+   failed `c-load` followed by `c-func 0 ...` can bind a symbol from a different
+   library. `plant.aura` gates on `aot:reload` first (it fails on dlopen
+   errors), probes `c-func` with `procedure?`, and boxes the handle as
+   `(list lib)`. A `-1` / error value on failure would remove the ambiguity.
+3. **`c-func` returns `0` on a missing symbol or bad signature** instead of an
+   error value. A slot bound to `0` then either returns `0` silently at top
+   level or triggers a file re-run (see the cannot-call issue).
+4. **`aot:reload` accepts a plain C `.so`.** It has no Aura func-table
+   registrations, but the reload still commits a table swap and bumps the epoch.
+   The loop uses it as a gate (version/region/defuse probe + proof stamp). A
+   native-kernel registration ABI (constructor registers `name -> fnptr` with a
+   signature) would let `aot:reload` bind the kernel directly instead of a
+   second `dlopen` through `c-load`.
+5. **`ast:rollback` does not exist.** Rollback is `ast:restore <snapshot>` +
+   `eval-current`, wrapped by `hot-strategy:heal!`.
+6. **`hot-strategy` tracks one active name.** Sinking several functions at
+   once needs per-name last-good records, or a snapshot per attempt (what the
+   loop does now through `register!`).
+7. **`list-sort` takes only a list of ints** and returns `()` when given a
+   comparator first. `identify.aura` uses its own insertion sort.
+8. **Default face.** On this tip the std prelude does not load on the default
+   Restricted face, and workspace calls after `set-code` + `eval-current` hit
+   "tree-walker fallback forbidden". The MVP therefore runs on the Soft face
+   only. `std/ffi` additionally needs `effect:ffi` under a sandbox.
+
+## Workarounds in this repo (remove when fixed upstream)
+
+| workaround | where | upstream |
+|---|---|---|
+| workspace constants are integers (`(>= (* 1000 ms-per-call) 50)`) | `lib/fixture.aura` | #4475 |
+| two `mutate:rebind` calls instead of one `mutate:atomic-batch` | `lib/loop.aura` (`loop:set-atomic-batch!`) | #4476 |
+| results stored with `set!`, not `(define x (attempt ...))` | `scripts/mvp.aura`, `tests/test_loop_*.aura` | #4476 |
+| test helper named `expect`, not `check` | `lib/expect.aura` | #4477 |
+| `RUN-ONCE` marker checked by `run_tests.sh` | `scripts/run_tests.sh` | #4476, #4478 |
+| `c-func` probed with `procedure?` before rebinding; handle boxed | `lib/plant.aura` | API gaps 2–3 |
+
+## Next steps
+
+1. Runtime call profile instead of the fixture column (needs gap 1).
+2. Kernel generator: emit `kernels/<name>.c` from the define's AST for the
+   numeric-loop subset, then build + sink without hand-written C.
+3. Float ABI kernels (`(Float Float) -> Float`), vector/opaque buffers through
+   `ffi:pin-buffer`.
+4. Turn `mutate:atomic-batch` back on once the re-run bug is fixed (one
+   MutationBoundary for bind + swap).
+5. Hot-swap the scoring weights and `sink-min-speedup` from an outer agent loop,
+   and record accepted sinks as "stable data plane" in a manifest.
+6. Restricted face: grant `effect:ffi`, check the AOT reload capability gate.

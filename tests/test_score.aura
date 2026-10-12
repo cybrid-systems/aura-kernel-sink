@@ -1,0 +1,59 @@
+; tests/test_score.aura — the multi-dimensional verdict rejects wrong, slow,
+; erroring and nondeterministic candidates, and accepts a faster correct one.
+; Pure Aura, no workspace mutation.
+(require "expect" all:)
+(require "score" all:)
+(display "RUN-ONCE") (newline)  ; run_tests.sh fails if this prints twice (silent file re-run)
+
+(define (ref n) (let loop ((i 0) (s 0)) (if (< i n) (loop (+ i 1) (+ s (* i i))) s)))
+(define good (lambda (n) (if (< n 1) 0 (quotient (* n (- n 1) (- (* 2 n) 1)) 6))))
+(define wrong (lambda (n) (+ 1 (good n))))
+(define slow (lambda (n) (begin (ref n) (ref n) (ref n) (ref n))))
+(define boom (lambda (n) (error "kernel crashed")))
+(define ctr 0)
+(define flaky (lambda (n) (begin (set! ctr (+ ctr 1)) (if (> n 100) (+ (good n) ctr) (good n)))))
+
+(define (has? x lst) (cond ((null? lst) #f) ((equal? (car lst) x) #t) (else (has? x (cdr lst)))))
+
+(define cases (list 0 1 2 10 100 1000))
+(define golden (score:golden ref cases))
+(define t-before (score:bench ref 5000 40))
+
+(expect "score: golden has one pair per case" (= (length golden) 6))
+(expect "score: golden(10) = 285" (equal? (cdr (car (cdr (cdr (cdr golden))))) 285))
+(expect "score: reference bench takes measurable time" (> t-before 0))
+(expect "score: reference passes its own golden" (= (score:check ref golden) 0))
+
+(define s-good (score:evaluate golden t-before good 5000 40 2))
+(score:print s-good)
+(expect "score: correct and faster -> accept" (score:accept? s-good))
+(expect "score: speedup >= 2" (>= (score:speedup s-good) 2))
+
+(define s-wrong (score:evaluate golden t-before wrong 5000 40 2))
+(score:print s-wrong)
+(expect "score: wrong result -> reject" (not (score:accept? s-wrong)))
+(expect "score: reason wrong-result" (has? "wrong-result" (score:reasons s-wrong)))
+(expect "score: every case mismatches" (= (score:mismatches s-wrong) 6))
+(expect "score: wrong is not benchmarked" (= (score:t-after s-wrong) 0))
+
+(define s-slow (score:evaluate golden t-before slow 5000 40 2))
+(score:print s-slow)
+(expect "score: slower -> reject" (not (score:accept? s-slow)))
+(expect "score: reason too-slow" (has? "too-slow" (score:reasons s-slow)))
+(expect "score: slow is still correct" (= (score:mismatches s-slow) 0))
+
+(define s-boom (score:evaluate golden t-before boom 5000 40 2))
+(score:print s-boom)
+(expect "score: raising candidate -> reject" (not (score:accept? s-boom)))
+(expect "score: raising counts as wrong-result" (has? "wrong-result" (score:reasons s-boom)))
+
+(define s-flaky (score:evaluate golden t-before flaky 5000 40 2))
+(score:print s-flaky)
+(expect "score: nondeterministic -> reject" (not (score:accept? s-flaky)))
+(expect "score: reason nondeterministic" (has? "nondeterministic" (score:reasons s-flaky)))
+
+; min-speedup is a control-plane knob: an impossible bar rejects even good.
+(define s-bar (score:evaluate golden t-before good 5000 40 1000000))
+(expect "score: min-speedup threshold is honoured" (has? "too-slow" (score:reasons s-bar)))
+
+(expect "checks all passed" (expect-summary))

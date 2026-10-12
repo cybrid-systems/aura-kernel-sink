@@ -1,0 +1,43 @@
+; tests/test_identify.aura — identify decides what to sink; the decision rule
+; is a workspace define that mutate:rebind can hot-swap.
+(require "expect" all:)
+(require "fixture" all:)
+(require "identify" all:)
+(display "RUN-ONCE") (newline)  ; run_tests.sh fails if this prints twice (silent file re-run)
+
+(set-code (fixture:workspace-code))
+(eval-current)
+
+(define policy (lambda (c m n) (sink-policy c m n)))
+(define recs (identify:run (fixture:candidates) fixture:probe policy))
+(identify:print recs)
+
+(define hot (identify:find recs "hot-sum-sq"))
+(define cold (identify:find recs "cold-add"))
+(define lbl (identify:find recs "label-of"))
+
+(expect "identify: hot-sum-sq is selected" (identify:decide? hot))
+(expect "identify: cold-add is not selected (per-call cost under the FFI floor)" (not (identify:decide? cold)))
+(expect "identify: label-of is not selected (not numeric)" (not (identify:decide? lbl)))
+(expect "identify: hot-sum-sq ranks first" (string=? (identify:name (car recs)) "hot-sum-sq"))
+(expect "identify: selected = (hot-sum-sq)" (equal? (identify:selected recs) (list "hot-sum-sq")))
+(expect "identify: hot-sum-sq costs more per call than cold-add" (> (identify:ms-per-call hot) (identify:ms-per-call cold)))
+(expect "identify: query:calls sees the driver call sites of hot-sum-sq" (>= (identify:static hot) 1))
+(expect "identify: label-of has no call sites" (= (identify:static lbl) 0))
+
+; Hot-update the decision rule: raise the budget, nothing qualifies.
+(expect "policy: rebind sink-policy (budget 1e9 ms)"
+       (equal? (mutate:rebind "sink-policy" (fixture:policy-body 1000000000 50) "raise budget") #t))
+(eval-current)
+(define recs2 (identify:run (fixture:candidates) fixture:probe policy))
+(expect "policy: raised budget selects nothing" (null? (identify:selected recs2)))
+
+; Lower the per-call floor to 1 us: cold-add now qualifies too.
+(expect "policy: rebind sink-policy (budget 1 ms, floor 1 us)"
+       (equal? (mutate:rebind "sink-policy" (fixture:policy-body 1 1) "lower floor") #t))
+(eval-current)
+(define recs3 (identify:run (fixture:candidates) fixture:probe policy))
+(expect "policy: lowered floor also selects cold-add" (identify:decide? (identify:find recs3 "cold-add")))
+(expect "policy: label-of still excluded" (not (identify:decide? (identify:find recs3 "label-of"))))
+
+(expect "checks all passed" (expect-summary))

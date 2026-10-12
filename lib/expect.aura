@@ -1,0 +1,26 @@
+; lib/expect.aura — tiny PASS/FAIL harness shared by tests/*.aura.
+; Named expect, not check: `check` is an Aura primitive, and after
+; set-code + eval-current a user define named check is replaced by the
+; primitive (aura#4477).
+; scripts/run_tests.sh fails a file on any FAIL line, a crash, a non-zero exit,
+; an `<error>` marker, or zero PASS lines.
+
+(export expect expect-near expect-summary)
+
+(define *expect-pass* 0)
+(define *expect-fail* 0)
+
+(define (expect name ok)
+  (if ok
+      (begin (set! *expect-pass* (+ *expect-pass* 1))
+             (display "PASS ") (display name) (newline) #t)
+      (begin (set! *expect-fail* (+ *expect-fail* 1))
+             (display "FAIL ") (display name) (newline) #f)))
+
+(define (expect-near name got want tol)
+  (expect name (and (number? got) (<= (abs (- got want)) tol))))
+
+(define (expect-summary)
+  (display "checks: ") (display *expect-pass*) (display " passed, ")
+  (display *expect-fail*) (display " failed") (newline)
+  (= *expect-fail* 0))

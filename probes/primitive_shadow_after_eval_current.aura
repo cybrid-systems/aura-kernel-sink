@@ -1,0 +1,10 @@
+; A user define named like a primitive (check) is replaced by the primitive
+; after set-code + eval-current.
+; Run: AURA_SANDBOX=off AURA_PIPELINE_STRICT=0 aura probes/primitive_shadow_after_eval_current.aura
+; Expected: (user-check before #t) 42 (user-check after #t) 42
+; Pinned tip: (user-check before #t) 42 1
+(define (check name ok) (display (list "user-check" name ok)) (newline) 42)
+(display (check "before" #t)) (newline)
+(set-code "(define (f x) x)")
+(eval-current)
+(display (check "after" #t)) (newline)
