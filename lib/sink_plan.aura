@@ -90,7 +90,7 @@
      "(let ((k " (sink-plan-cfunc p lib (sink-plan:symbol p) (sink-plan:sig p)) ") "
      "(o " (sink-plan-cfunc p lib (string-append (sink-plan:symbol p) "_overflowed") "() -> Int") ")) "
      "(lambda (" args ") (let ((r (k " args "))) "
-     "(if (= (o) 0) r (error \"sink: int overflow in " (sink-plan:name p) " (outside Aura Int range)\")))))")))
+     "(if (= (o) 0) r (error \"sink: int overflow/div0 in " (sink-plan:name p) " (outside Aura Int range, or division by zero)\")))))")))
 
 ; The exact primitive sequence loop.aura runs for this plan (documentation and
 ; trace output; nothing here is executed).

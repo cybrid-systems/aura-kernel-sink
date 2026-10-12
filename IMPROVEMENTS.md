@@ -16,6 +16,7 @@ Each has a minimal repro in `probes/`.
 - #4481 closures (a plant built by `plant:real`) passed inline as an argument to a top-level form that runs `hot-strategy:register!` + `mutate:rebind` + `eval-current` become `cannot call: ''` and the file silently re-runs; bound to a top-level define first it works. Probe: `probes/inline_plant_cannot_call.aura`. Hit by the first draft of `tests/test_kgen.aura`.
 - #4482 negative Int at or below about -5·10^15 is Float (literals, arithmetic results) and comes back corrupt from a `c-func ... -> Int` (prints `0`/`<unknown>`, `integer?` is #f, `=` raises `expected Int, got String ''`); the positive side is fine up to 2^62-1. Hit by `tests/test_kgen_overflow.aura`; generated Int kernels fail closed on results < -4999999999999999 (`AURA_SINK_RET_MIN`) until it is fixed.
 - #4483 a `c-func ... -> Int` returning a long outside the fixnum range aborts the process (SIGABRT, `try` cannot catch it). This is why overflow is signalled through a separate `<symbol>_overflowed` status, not an out-of-range sentinel.
+- #4485 `string->number` on integer strings goes through double: it rounds above 2^53 (`"9007199254740993"` → ...992) and SIGABRTs, uncatchable, at `"4611686018427387903"`. It crashed kernel generation on a define containing 2^62-1. Workaround: `kg-int-literal?` recognises integer literals by their characters (≤ 2^62-1) and emits them verbatim.
 - #4480 `map` corrupts earlier results when the mapped procedure calls another procedure (regression in b13af9334..94ca96362, still on d89d39c56). Workaround: lib/discover.aura builds rows with plain recursion.
 
 ## Aura API gaps (not filed as bugs)
@@ -86,8 +87,9 @@ Each has a minimal repro in `probes/`.
 
 1. ~~Runtime call profile instead of the fixture column~~ done (interim wrappers, `lib/counter.aura`); switch to a native per-define counter when Aura has one (gap 1). Also: auto-discover candidates (every numeric define) instead of the fixed three, and keep a rolling window across `eval-current`.
 2. ~~Kernel generator~~ done for the Int subset (`lib/kgen.aura`). Next: `let`
-   bindings, `quotient`/`remainder` with an explicit zero guard that returns a
-   sentinel the wrapper turns into the Aura error, ~~checked arithmetic for the
+   bindings, ~~`quotient` with an explicit zero guard~~ (done: `sink_ck_quo`,
+   divisor checked before `/`, div0 = status bit 2, MIN/-1 = overflow; Int `/` too),
+   `remainder`/`modulo` (same guard; modulo sign fix-up), ~~checked arithmetic for the
    fixnum range instead of `-fwrapv`~~ (done: `sink_ck_*` + `<symbol>_overflowed`
    status, fail closed with an Aura error; drop the -5e15 return guard once
    #4482 is fixed), ~~Float bodies~~, and multi-loop/nested-loop coverage tests.

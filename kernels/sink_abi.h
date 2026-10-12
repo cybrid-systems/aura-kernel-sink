@@ -32,7 +32,7 @@
 #define AURA_SINK_FIX_MIN (-AURA_SINK_FIX_MAX - 1)
 
 static inline int64_t sink_fix_(int64_t r, int wrapped, int *ovf) {
-  if (wrapped || r > AURA_SINK_FIX_MAX || r < AURA_SINK_FIX_MIN) *ovf = 1;
+  if (wrapped || r > AURA_SINK_FIX_MAX || r < AURA_SINK_FIX_MIN) *ovf |= 1;
   return r;
 }
 static inline int64_t sink_ck_add(int64_t a, int64_t b, int *ovf) {
@@ -48,6 +48,18 @@ static inline int64_t sink_ck_neg(int64_t a, int *ovf) {
   int64_t r; int w = __builtin_sub_overflow((int64_t)0, a, &r); return sink_fix_(r, w, ovf);
 }
 
+/* Truncating quotient (Aura `quotient` and Int `/`: (quotient -7 2) = -3,
+ * same as C99 `/`). The divisor is checked BEFORE dividing: b == 0 sets the
+ * div0 bit (2) and returns 0 without executing `/`; INT64_MIN / -1 (UB in C)
+ * is never executed (b == -1 goes through checked negation). A fixnum
+ * quotient can only leave the fixnum range as -2^62 / -1 = 2^62, which the
+ * range check flags as overflow (1). */
+static inline int64_t sink_ck_quo(int64_t a, int64_t b, int *ovf) {
+  if (b == 0) { *ovf |= 2; return 0; }
+  if (b == -1) return sink_ck_neg(a, ovf);
+  return sink_fix_(a / b, 0, ovf);
+}
+
 /* Return guard. The pinned Aura tip cannot take a negative Int at or below
  * -5*10^15 back across c-func (observed boundary: -4999999999999999 works,
  * -5000000000000000 comes back corrupt; Aura literals and arithmetic there
@@ -59,7 +71,7 @@ static inline int64_t sink_ck_neg(int64_t a, int *ovf) {
 #endif
 static inline int sink_ck_ret(int64_t r, int ovf) { return ovf || r < AURA_SINK_RET_MIN; }
 
-/* Per-kernel overflow status (thread-local; read-and-clear accessor). */
+/* Per-kernel status (thread-local; read-and-clear accessor): 0 ok, bit 1 = overflow, bit 2 = div0. */
 #define AURA_SINK_OVF_DECL(sym) static _Thread_local long sym##_ovf_;
 #define AURA_SINK_OVF_STATUS(sym) \
   AURA_SINK_EXPORT long sym##_overflowed(void) { long v = sym##_ovf_; sym##_ovf_ = 0; return v; }

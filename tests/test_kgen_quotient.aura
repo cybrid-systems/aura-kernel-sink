@@ -1,0 +1,72 @@
+;; tests/test_kgen_quotient.aura — checked Int quotient / Int `/` in generated kernels.
+;; In range: kernel == Aura Soft (both truncate toward zero).
+;; Div by zero: Aura Soft raises a catchable error ("quotient: division by
+;; zero" / "/: division by zero"); the kernel never executes `/`, returns 0
+;; with status bit 2, and the sink wrapper raises
+;; (error "sink: int overflow/div0 in <name> ..."), i.e. fail closed with an
+;; Aura error on both sides. -2^62 / -1 = 2^62 leaves the fixnum range: status
+;; bit 1 (overflow). Soft cannot be the reference there (-2^62 is not usable
+;; from Aura on the pinned tip, aura#4482), so no Aura value is compared.
+(require "expect" all:)
+(require "fixture" all:)
+(require "kgen" all:)
+(require "sink_plan" all:)
+(require "std/ffi" all:)
+(display "RUN-ONCE") (newline)
+
+(define (has-sub? s sub)
+  (let ((n (string-length s)) (m (string-length sub)))
+    (let loop ((i 0)) (cond ((> (+ i m) n) #f) ((string=? (substring s i (+ i m)) sub) #t) (else (loop (+ i 1)))))))
+
+; Aura references (host defines, same bodies as fixture:overflow-src)
+(define (ov-quo a b) (quotient a b))
+(define (ov-div a b) (/ a b))
+(define (ov-qloop n d) (let lp ((n n) (k 0)) (if (> n 0) (lp (quotient n d) (+ k 1)) k)))
+
+(define (kern name sig)
+  (let ((lib (c-load (fixture:so (kgen:base name)))))
+    (list (c-func lib (kgen:symbol name) sig)
+          (c-func lib (string-append (kgen:symbol name) "_overflowed") "() -> Int"))))
+(define (k-f k) (car k))
+(define (k-o k) (car (cdr k)))
+(define kquo (kern "ov-quo" "(Int Int) -> Int"))
+(define kdiv (kern "ov-div" "(Int Int) -> Int"))
+(define kqmin (kern "ov-qmin" "(Int) -> Int"))
+(define kqloop (kern "ov-qloop" "(Int Int) -> Int"))
+(expect "quotient kernels built and resolve" (and (procedure? (k-f kquo)) (procedure? (k-o kdiv)) (procedure? (k-f kqmin)) (procedure? (k-f kqloop))))
+
+(define (same2 k ref a b) (let ((r ((k-f k) a b))) (and (= ((k-o k)) 0) (= r (ref a b)))))
+(define (st2 k a b want) (let ((r ((k-f k) a b))) (let ((o ((k-o k)))) (and (= r 0) (= o want) (= ((k-o k)) 0)))))
+(define (st1 k a want) (let ((r ((k-f k) a))) (let ((o ((k-o k)))) (and (= r 0) (= o want) (= ((k-o k)) 0)))))
+(define fmax 4611686018427387903)
+(define nedge -4503599627370496)
+
+(expect "golden quotient: signs truncate toward zero == Aura"
+        (and (same2 kquo ov-quo 7 2) (same2 kquo ov-quo -7 2) (same2 kquo ov-quo 7 -2) (same2 kquo ov-quo -7 -2) (same2 kquo ov-quo -9 4) (same2 kquo ov-quo 0 5)))
+(expect "golden quotient: edges == Aura" (and (same2 kquo ov-quo fmax 1) (same2 kquo ov-quo fmax 2) (same2 kquo ov-quo fmax fmax) (same2 kquo ov-quo nedge -1) (same2 kquo ov-quo nedge 3) (same2 kquo ov-quo 3 fmax)))
+(expect "golden Int / == Aura (/ truncates on Int)" (and (same2 kdiv ov-div 7 2) (same2 kdiv ov-div -9 4) (same2 kdiv ov-div 100 7) (same2 kdiv ov-div fmax 3)))
+(expect "golden quotient loop (digit count) == Aura" (and (same2 kqloop ov-qloop 1000000 10) (same2 kqloop ov-qloop fmax 2) (same2 kqloop ov-qloop 0 10)))
+(expect "golden: -2^62 / 1000000 in range (result above the return guard)" (let ((r ((k-f kqmin) 1000000))) (and (= ((k-o kqmin)) 0) (= r -4611686018427))))
+
+; Aura Soft on div0: catchable error (so fail closed matches Soft's outcome)
+(define (caught? thunk) (let ((v (try (thunk) (catch (e) (list "caught" e))))) (and (pair? v) (equal? (car v) "caught"))))
+(expect "Aura Soft: (quotient a 0) is a catchable error" (caught? (lambda () (ov-quo 5 (- 2 2)))))
+(expect "Aura Soft: Int (/ a 0) is a catchable error" (caught? (lambda () (ov-div 5 0))))
+
+; kernel: div0 -> 0 + status 2 (divisor checked before /), status clears
+(expect "div0 quotient: fail closed, status=2 (div0)" (and (st2 kquo 5 0 2) (st2 kquo 0 0 2) (st2 kquo fmax 0 2)))
+(expect "div0 /: fail closed, status=2" (st2 kdiv -7 0 2))
+(expect "div0 in loop: first iteration stops the loop (no spin)" (st2 kqloop 12345 0 2))
+(expect "MIN/-1: -2^62 / -1 = 2^62 -> overflow, status=1" (st1 kqmin -1 1))
+(expect "-2^62 / 1: in fixnum, refused by the return guard (aura#4482)" (st1 kqmin 1 1))
+(expect "status per call: next in-range call clean" (same2 kquo ov-quo 9 3))
+
+; through the checked slot body: Aura error naming div0
+(define p-q (sink-plan:make "ov-quo" "x.so" (kgen:symbol "ov-quo") 2 "" ""))
+(expect "plan: generated quotient kernel is checked; error text says overflow/div0"
+        (and (sink-plan:checked? p-q) (has-sub? (sink-plan:bind-body p-q 3) "(error \"sink: int overflow/div0 in ov-quo")))
+(define (wrapped a b)
+  (let ((r ((k-f kquo) a b)))
+    (if (= ((k-o kquo)) 0) r (error (string-append "sink: int overflow/div0 in ov-quo")))))
+(expect "wrapper: div0 raises an Aura error, kernel usable after" (and (caught? (lambda () (wrapped 1 0))) (= (wrapped 10 3) 3)))
+(expect-summary)

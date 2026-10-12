@@ -22,7 +22,7 @@
 ; Rejected with a reason: string / boolean values, float literals in an Int
 ; kernel, other calls
 ; (callbacks into Aura are impossible from a kernel), non-tail recursion,
-; division (Aura error semantics on 0), begin / set! / multi-form bodies.
+; remainder / modulo / Float division, begin / set! / multi-form bodies.
 ;
 ; Int arithmetic is overflow-checked against the Aura fixnum range
 ; [-2^62, 2^62-1]: every + - * (and unary -) goes through sink_ck_add / sink_ck_sub /
@@ -68,10 +68,20 @@
 ; build/gen/<base>.c -> build/kernels/lib<base>.so
 (define (kgen:base name) (string-append "gen_" (kg-sanitize name)))
 
-(define (kg-int-literal? a)
+; Decimal integer literals are recognised lexically and emitted verbatim
+; (INT64_C(<text>)): on the pinned tip string->number goes through double, so
+; it rounds above 2^53 and SIGABRTs (uncatchable) at 2^62-1 (aura#4485).
+; Accepted magnitude: <= 2^62-1 (fixnum max); C sees the exact value.
+(define (kg-digit? c) (and (>= c 48) (<= c 57)))
+(define (kg-digits? a i) (cond ((>= i (string-length a)) #t) ((kg-digit? (string-ref a i)) (kg-digits? a (+ i 1))) (else #f)))
+(define (kg-int-text? a)
   (and (string? a) (not (kg-strlit? a))
-       (let ((n (try (string->number a) (catch (e) #f))))
-         (and (number? n) (integer? n) (not (kg-has-dot? a 0))))))
+       (let ((s (if (and (> (string-length a) 1) (= (string-ref a 0) 45)) 1 0)))
+         (and (> (string-length a) s) (kg-digits? a s)))))
+(define (kg-int-literal? a)
+  (and (kg-int-text? a)
+       (let* ((s (if (= (string-ref a 0) 45) 1 0)) (m (substring a s (string-length a))) (n (string-length m)))
+         (or (< n 19) (and (= n 19) (not (string>? m "4611686018427387903")))))))
 (define (kg-float-literal? a)
   (and (string? a) (not (kg-strlit? a))
        (let ((n (try (string->number a) (catch (e) #f))))
@@ -105,6 +115,16 @@
 (define (kg-checked op)
   (cond ((string=? op "+") "sink_ck_add") ((string=? op "-") "sink_ck_sub") (else "sink_ck_mul")))
 
+; left fold of sink_ck_quo: (/ a b c) = (quotient (quotient a b) c)
+(define (kg-quo args env loops)
+  (let loop ((xs args) (acc "") (first #t))
+    (if (null? xs)
+        (kg-ok acc)
+        (let ((r (kg-expr (car xs) env loops)))
+          (if (kg-ok? r)
+              (loop (cdr xs) (if first (kg-val r) (string-append "sink_ck_quo(" acc ", " (kg-val r) ", &ovf)")) #f)
+              r)))))
+
 (define (kg-expr t env loops)
   (cond
     ((string? t)
@@ -113,6 +133,7 @@
            ((and kg-float-mode (kg-float-literal? t)) (kg-ok (kg-c-double t)))
            ((kg-int-literal? t) (kg-ok (string-append "INT64_C(" t ")")))
            ((kg-lookup t env) (kg-ok (car (cdr (kg-lookup t env)))))
+           ((kg-int-text? t) (kg-err (string-append "integer literal " t " outside the Aura fixnum range")))
            ((and (string->number t) #t) (kg-err (string-append "non-integer literal " t)))
            (else (kg-err (string-append "free variable " t)))))
     ((null? t) (kg-err "empty form"))
@@ -138,8 +159,11 @@
             (cond ((not (kg-ok? c)) c) ((not (kg-ok? a)) a) ((not (kg-ok? b)) b)
                   (else (kg-ok (string-append "(" (kg-val c) " ? " (kg-val a) " : " (kg-val b) ")"))))))
          ((kg-lookup h loops) (kg-err (string-append "non-tail recursive call to " h)))
+         ; Int quotient / Int `/` (Aura truncates both): checked, divisor tested before `/`
+         ((and (not kg-float-mode) (string=? h "quotient") (= (kg-len args) 2)) (kg-quo args env loops))
+         ((and (not kg-float-mode) (string=? h "/") (> (kg-len args) 1)) (kg-quo args env loops))
          ((or (string=? h "quotient") (string=? h "remainder") (string=? h "modulo") (string=? h "/"))
-          (kg-err (string-append "division " h " (Aura error on 0) unsupported")))
+          (kg-err (string-append "division " h " unsupported (only Int quotient and Int / with 2+ args)")))
          (else (kg-err (string-append "unsupported call " h))))))))
 
 (define (kg-cmp? h) (or (string=? h "<") (string=? h ">") (string=? h "<=") (string=? h ">=") (string=? h "=")))
@@ -305,7 +329,7 @@
              "top_0: ;\n"
              (kg-val r)
              (if kg-float-mode ""
-                 (string-append "ovf_exit:\n  " (kgen:symbol name) "_ovf_ = 1;\n  return 0;\n"))
+                 (string-append "ovf_exit:\n  " (kgen:symbol name) "_ovf_ = ovf ? ovf : 1;\n  return 0;\n"))
              "}\n"
              (if kg-float-mode "" (string-append "AURA_SINK_OVF_STATUS(" (kgen:symbol name) ")\n")))))))))
 

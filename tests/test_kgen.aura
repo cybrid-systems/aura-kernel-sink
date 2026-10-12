@@ -45,8 +45,12 @@
 (expect "kgen label-of: reason string literal" (has-sub? (reason r-label) "string literal"))
 (expect "kgen non-tail recursion (fact): skipped"
         (has-sub? (reason (gen "(define fact (lambda (n) (if (< n 2) 1 (* n (fact (- n 1))))))" "fact")) "non-tail"))
-(expect "kgen quotient: skipped (Aura error on 0)"
-        (has-sub? (reason (gen "(define half (lambda (n) (quotient n 2)))" "half")) "division"))
+(expect "kgen quotient: generated, divisor checked before /"
+        (let ((r (gen "(define half (lambda (n) (quotient n 2)))" "half"))) (and (ok? r) (has-sub? (reason r) "sink_ck_quo("))))
+(expect "kgen remainder: still skipped"
+        (has-sub? (reason (gen "(define rm (lambda (n) (remainder n 2)))" "rm")) "division"))
+(expect "kgen unary /: skipped"
+        (has-sub? (reason (gen "(define inv (lambda (n) (/ n)))" "inv")) "division"))
 (expect "kgen float literal: skipped"
         (has-sub? (reason (gen "(define fl (lambda (x) (* x 1.5)))" "fl")) "non-integer"))
 (expect "kgen call into another define: skipped"
