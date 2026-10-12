@@ -1,0 +1,91 @@
+; tests/test_discover.aura — automatic candidate discovery: no hand-written
+; candidate list; the set comes from the workspace (query:code), live counters
+; and query:calls, and the decision is still the hot-swappable sink-policy.
+(require "expect" all:)
+(require "fixture" all:)
+(require "identify" all:)
+(require "counter" all:)
+(require "discover" all:)
+(display "RUN-ONCE") (newline)  ; run_tests.sh fails if this prints twice (silent file re-run)
+
+; Reader round trip.
+(define forms (discover:read "(define (f a) (+ a 1)) (define s \"x y\")"))
+(expect "reader: two top-level forms" (= (length forms) 2))
+(expect "reader: string literal kept as one atom" (equal? (car (cdr (cdr (car (cdr forms))))) "\"x y\""))
+
+; Empty workspace: nothing discovered, nothing selected.
+(set-code "(define sink-calls (make-vector 8 0))\n(define (sink-policy c m n) #t)\n")
+(eval-current)
+(define empty-cands (discover:candidates (discover:defines (discover:scan))))
+(expect "empty: sink-* machinery is never a candidate" (null? empty-cands))
+(expect "empty: identify on the discovered set selects nothing"
+        (null? (identify:selected (identify:run (discover:rows empty-cands 5000) discover:probe
+                                                (lambda (c m n) (sink-policy c m n)) (lambda (n) 0)))))
+
+; The fixture workspace.
+(set-code (fixture:workspace-code))
+(eval-current)
+(define defs (discover:defines (discover:scan)))
+(expect "scan: workspace defines are read back from query:code" (>= (length defs) 8))
+(define cands (discover:candidates defs))
+(discover:print cands)
+(define names (map car cands))
+(expect "discover: candidates = hot-sum-sq cold-add label-of (workspace order)"
+        (equal? names (list "hot-sum-sq" "cold-add" "label-of")))
+(expect "discover: app-workload excluded (calls other defines, not a leaf)" (not (member "app-workload" names)))
+(expect "discover: sink-policy / sink-impl-* excluded (sink-* namespace)" (not (member "sink-policy" names)))
+(define (cand n) (let loop ((cs cands)) (if (string=? (car (car cs)) n) (car cs) (loop (cdr cs)))))
+(expect "discover: hot-sum-sq is Int-callable, arity 1"
+        (and (car (cdr (cdr (cand "hot-sum-sq")))) (= (car (cdr (cand "hot-sum-sq"))) 1)))
+(expect "discover: cold-add arity 2" (= (car (cdr (cand "cold-add"))) 2))
+(expect "discover: label-of is not Int-callable" (not (car (cdr (cdr (cand "label-of"))))))
+(expect "discover: wrapper target reuses sink-impl-hot-sum-sq"
+        (equal? (car (cdr (cdr (cdr (cdr (cand "hot-sum-sq")))))) "sink-impl-hot-sum-sq"))
+(expect "discover: no static window -> static call sites keep all three"
+        (= (length (discover:hot cands #f 1)) 3))
+
+; Instrument the discovered set and read live counts.
+(expect "instrument: discovered candidates hot-swapped into counting wrappers" (discover:instrument! cands))
+(expect "instrument: slots in workspace order" (and (= (discover:index "hot-sum-sq") 0) (= (discover:index "label-of") 2)))
+(expect "instrument: fixture:index follows the discovery registry" (= (fixture:index "cold-add") 1))
+(define live (discover:observe (lambda () (app-workload 400 #t))))
+(expect "live: hot-sum-sq 400 calls" (= (live "hot-sum-sq") 400))
+(expect "live: cold-add 4800 calls" (= (live "cold-add") 4800))
+(expect "instrumented body still correct" (= (hot-sum-sq 4) 14))
+
+(define policy (lambda (c m n) (sink-policy c m n)))
+(define hot-cands (discover:hot cands live 1))
+(define recs (identify:run (discover:rows hot-cands 5000) discover:probe policy live))
+(identify:print recs)
+(expect "identify(discovered): selected = (hot-sum-sq)" (equal? (identify:selected recs) (list "hot-sum-sq")))
+(expect "identify(discovered): cold-add not selected" (not (identify:decide? (identify:find recs "cold-add"))))
+(expect "identify(discovered): label-of not selected" (not (identify:decide? (identify:find recs "label-of"))))
+
+; Threshold on live counts drops rarely called defines before identify.
+(expect "hot: min-calls 1000 keeps only cold-add (4800 calls)"
+        (equal? (map car (discover:hot cands live 1000)) (list "cold-add")))
+
+; Cold workload: hot-sum-sq never called -> dropped by the live filter,
+; and even unfiltered the policy selects nothing.
+(define cold-live (discover:observe (lambda () (app-workload 400 #f))))
+(expect "cold: hot-sum-sq has 0 live calls" (= (cold-live "hot-sum-sq") 0))
+(expect "cold: live filter drops hot-sum-sq" (not (member "hot-sum-sq" (map car (discover:hot cands cold-live 1)))))
+(expect "cold: nothing selected"
+        (null? (identify:selected (identify:run (discover:rows (discover:hot cands cold-live 1) 5000)
+                                                discover:probe policy cold-live))))
+
+; Policy stays hot-swappable on the discovered set.
+(expect "policy: rebind sink-policy (budget 1e9 ms)"
+        (equal? (mutate:rebind "sink-policy" (fixture:policy-body 1000000000 50) "raise budget") #t))
+(eval-current)
+(define live2 (discover:observe (lambda () (app-workload 400 #t))))
+(expect "policy: raised budget selects nothing from the discovered set"
+        (null? (identify:selected (identify:run (discover:rows hot-cands 5000) discover:probe policy live2))))
+
+;  A define that was never listed anywhere is discovered from the workspace.
+; (Discovery only; this 9-procedure workspace is not timed, aura#4479.)
+(set-code (string-append (fixture:workspace-code) "(define tri-sum (lambda (n) (let loop ((i 0) (s 0)) (if (< i n) (loop (+ i 1) (+ s i)) s))))\n"))
+(eval-current)
+(expect "new define: tri-sum discovered with no list edit"
+        (member "tri-sum" (map car (discover:candidates (discover:defines (discover:scan))))))
+(expect "checks all passed" (expect-summary))

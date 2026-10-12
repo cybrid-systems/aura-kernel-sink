@@ -13,7 +13,14 @@ Each has a minimal repro in `probes/`.
 | [#4477](https://github.com/cybrid-systems/aura/issues/4477) | a user define shadowing a primitive (`check`) reverts to the primitive after `eval-current` | `probes/primitive_shadow_after_eval_current.aura` | the PASS/FAIL helper turned into a silent no-op (`0 passed, 0 failed`) |
 | [#4478](https://github.com/cybrid-systems/aura/issues/4478) | runtime `cannot call` re-runs earlier forms (residual of #4355); `(5 5)` / `(z 5)` return a value silently | `probes/cannot_call_rerun.aura`, `probes/apply_non_procedure.aura` | a kernel slot holding `0` (failed `c-func`) re-runs the file or yields `0` |
 
+- #4480 `map` corrupts earlier results when the mapped procedure calls another procedure (regression in b13af9334..94ca96362, still on d89d39c56). Workaround: lib/discover.aura builds rows with plain recursion.
+
 ## Aura API gaps (not filed as bugs)
+
+- No define/node accessor bound in file mode: `query:defines` returns node ids but `query:node` / `query:children` / `ast:defs` are unbound, so discovery parses the `(query:code)` string itself. No `procedure-arity` / `string->symbol`; `(eval "name")` is used to resolve a define.
+- `(eval "nosuch")` error says `did you forget to define ` (name lost).
+- A probe closure over an `(eval name)` value called in a calibration loop inside a library failed with `invalid closure: eval_flat` on d89d39c56 (not minimized, not filed); discover calls the procedure directly instead.
+
 
 1. **No per-define runtime call counter.** No `query:*` / `engine:metrics` key
    on `94ca96362` reports invocations per define; `query:calls` is static call
@@ -52,6 +59,8 @@ Each has a minimal repro in `probes/`.
    only. `std/ffi` additionally needs `effect:ffi` under a sandbox.
 
 ## Workarounds in this repo (remove when fixed upstream)
+
+- discover: no `map` with calling procedures (#4480); calibration calls `(eval name)` directly, not via a probe closure.
 
 | workaround | where | upstream |
 |---|---|---|

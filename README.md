@@ -78,6 +78,10 @@ checks: 8 passed, 0 failed
 - 限制：计数器在 workspace 里，`eval-current` 会重新求值 `(define sink-calls ...)` 并清零，所以计数是从上次 `eval-current` 开始的窗口；包装引用的是 workspace 名字（引用宿主文件的 define 会让 `mutate:rebind` 类型检查报 unbound）。这不是 VM 级计数器，Aura 提供按 define 的原生计数后应替换。
 - workspace 要保持 ≤8 个过程 define：第 9 个会让无关函数调用慢约 35 倍（aura#4479），这会让基线变慢、把本该拒绝的 kernel 判成更快。所以计数是内联在包装里，没有单独的 `sink-tick!`。
 
+### 自动发现候选（`lib/discover.aura`）
+
+不再有手写候选清单。`discover:scan` 读 `(query:code)`（规范化后的工作区源码），解析出每个顶层 `(define NAME (lambda ...))`，按以下规则筛选：不在 `sink-*` 命名空间；叶子函数（函数体不引用其他工作区 define，C kernel 无法回调 Aura，所以 `app-workload` 这类驱动函数被排除）；固定 1–4 个参数；用小整数实际调用一次返回整数（Int-callable，`label-of` 因返回字符串被排除）。发现的集合经 `discover:instrument!` 自动换成计数包装（槽位按工作区顺序，最多 8 个），跑完活负载后 `discover:hot` 只保留调用数 ≥ 阈值的（没有活窗口时退回到 `query:calls` 静态调用点 ≥1）。`discover:rows` 生成 identify 行（自动标定重复次数），最终决策仍由可热换的 `sink-policy` 做。新加一个 define 不用改任何清单就能被发现。
+
 ### 什么是真的，什么是替身
 
 | 步骤 | 状态 |
@@ -152,6 +156,10 @@ The runner fails a test file on a FAIL line, a crash, a non-zero exit, an error
 line, zero PASS lines, or a `RUN-ONCE` marker that is not printed exactly once
 (the Soft file runner can silently re-run a whole file, which would repeat every
 mutation).
+
+### Automatic candidate discovery (`lib/discover.aura`)
+
+No hand-written candidate list: `discover:scan` reads `(query:code)`, keeps top-level `(define NAME (lambda ...))` forms that are outside `sink-*`, leaves (body names no other workspace define), fixed arity 1..4, and Int-callable (a probe call with small integers returns an integer). `discover:instrument!` swaps them into counting wrappers (slots in workspace order, max 8), `discover:hot` keeps those with live calls >= min-calls (static `query:calls` sites when no live window), and `discover:rows` feeds identify; the decision is still the hot-swappable `sink-policy`. `scripts/mvp.aura` uses the discovered set.
 
 ### What runs for real vs stubbed
 

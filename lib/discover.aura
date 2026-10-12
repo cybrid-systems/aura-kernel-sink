@@ -1,0 +1,285 @@
+; lib/discover.aura — automatic discovery of sink candidates.
+;
+; No hand-written candidate list. The candidate set is derived from the live
+; workspace every time:
+;
+;   1. scan     (query:code) returns the canonical (desugared) workspace
+;               source as a string; a small reader here turns it into a tree
+;               and keeps every top-level (define NAME (lambda PARAMS BODY..)).
+;   2. filter   static rules — a candidate must be
+;                 * outside the sink-* namespace (sink-policy, sink-calls,
+;                   sink-kernel-*, sink-impl-* are the sink's own machinery);
+;                 * a leaf: its body names no other workspace define (self
+;                   recursion is fine). A C kernel cannot call back into Aura,
+;                   so drivers like app-workload are never candidates;
+;                 * fixed arity (PARAMS is a list), 1..4 parameters;
+;               and one dynamic rule — Int-callable: calling it with small
+;               integers returns an integer (label-of returns strings; a body
+;               string literal rejects it before the probe).
+;   3. instrument  every discovered define is hot-swapped into a counting
+;               wrapper (lib/counter.aura, mutate:rebind); counter slots are
+;               assigned in workspace order and recorded in a registry here.
+;   4. hot      after a live workload window, keep rows whose live call count
+;               is >= min-calls; without a live window (calls-of = #f), keep
+;               rows with at least one static call site (query:calls).
+;
+; Output rows have the identify row shape
+;   (name arity numeric? counter-index bench-arg bench-reps)
+; with bench-reps calibrated so one measurement takes >= ~10 ms.
+; The DECISION stays with the hot-swappable workspace sink-policy (identify).
+;
+; Capacity: counter:workspace-code allocates discover:max-candidates slots;
+; candidates beyond that are discovered but not instrumented.
+
+(export discover:read
+        discover:scan
+        discover:defines
+        discover:candidates
+        discover:instrument!
+        discover:index
+        discover:names
+        discover:observe
+        discover:hot
+        discover:probe
+        discover:rows
+        discover:max-candidates
+        discover:print)
+
+(require "counter" all:)
+
+(define (discover:max-candidates) 8)
+
+; ---------------------------------------------------------------- reader
+; Tree: a list for (...), a string for an atom. A string-literal atom keeps
+; its double quotes, so dc-strlit? tells it from a symbol.
+(define (dc-ws? c) (or (= c 32) (= c 10) (= c 9) (= c 13)))
+(define (dc-delim? c) (or (dc-ws? c) (= c 40) (= c 41)))
+
+(define (dc-rev xs) (let loop ((xs xs) (acc (list))) (if (null? xs) acc (loop (cdr xs) (cons (car xs) acc)))))
+
+; Tokens: "(" ")" atoms and "\"literal\"".
+(define (dc-tokens s)
+  (let ((n (string-length s)))
+    (let loop ((i 0) (acc (list)))
+      (if (>= i n)
+          (dc-rev acc)
+          (let ((c (string-ref s i)))
+            (cond
+              ((dc-ws? c) (loop (+ i 1) acc))
+              ((= c 40) (loop (+ i 1) (cons "(" acc)))
+              ((= c 41) (loop (+ i 1) (cons ")" acc)))
+              ((= c 34) (loop (dc-str-end s (+ i 1) n) (cons (substring s i (dc-str-end s (+ i 1) n)) acc)))
+              (else (loop (dc-atom-end s i n) (cons (substring s i (dc-atom-end s i n)) acc)))))))))
+
+; Index just past the closing quote (or n).
+(define (dc-str-end s j n)
+  (cond ((>= j n) n)
+        ((= (string-ref s j) 92) (dc-str-end s (+ j 2) n))
+        ((= (string-ref s j) 34) (+ j 1))
+        (else (dc-str-end s (+ j 1) n))))
+
+(define (dc-atom-end s j n)
+  (if (or (>= j n) (dc-delim? (string-ref s j))) j (dc-atom-end s (+ j 1) n)))
+
+; Parse one form from a token list; returns (tree . rest).
+(define (dc-parse toks)
+  (cond
+    ((null? toks) (cons (list) (list)))
+    ((string=? (car toks) "(") (dc-items (cdr toks) (list)))
+    (else (cons (car toks) (cdr toks)))))
+
+(define (dc-items ts acc)
+  (cond ((null? ts) (cons (dc-rev acc) (list)))
+        ((string=? (car ts) ")") (cons (dc-rev acc) (cdr ts)))
+        (else (let ((r (dc-parse ts))) (dc-items (cdr r) (cons (car r) acc))))))
+
+; All top-level forms of source string s.
+(define (discover:read s)
+  (let loop ((ts (dc-tokens s)) (acc (list)))
+    (if (null? ts)
+        (dc-rev acc)
+        (let ((r (dc-parse ts))) (loop (cdr r) (cons (car r) acc))))))
+
+(define (dc-strlit? a) (and (string? a) (> (string-length a) 0) (= (string-ref a 0) 34)))
+
+; Tree back to source text.
+(define (dc-write t)
+  (if (string? t)
+      t
+      (let loop ((xs t) (acc "(") (first #t))
+        (if (null? xs)
+            (string-append acc ")")
+            (loop (cdr xs) (string-append acc (if first "" " ") (dc-write (car xs))) #f)))))
+
+; ---------------------------------------------------------------- scan
+; Top-level forms of the workspace. (query:code) wraps several defines in
+; (begin ...); a single define comes back bare.
+(define (discover:scan)
+  (let ((src (try (query:code) (catch (e) ""))))
+    (if (not (string? src))
+        (list)
+        (let ((forms (discover:read src)))
+          (if (and (= (length forms) 1) (pair? (car forms))
+                   (equal? (car (car forms)) "begin"))
+              (cdr (car forms))
+              forms)))))
+
+; Define records (name value-tree) for every (define NAME VALUE).
+(define (discover:defines forms)
+  (cond
+    ((null? forms) (list))
+    ((and (pair? (car forms)) (= (length (car forms)) 3)
+          (equal? (car (car forms)) "define") (string? (car (cdr (car forms)))))
+     (cons (list (car (cdr (car forms))) (car (cdr (cdr (car forms)))))
+           (discover:defines (cdr forms))))
+    (else (discover:defines (cdr forms)))))
+
+(define (dc-prefix? p s)
+  (and (>= (string-length s) (string-length p)) (string=? (substring s 0 (string-length p)) p)))
+
+(define (dc-member? x xs) (cond ((null? xs) #f) ((equal? x (car xs)) #t) (else (dc-member? x (cdr xs)))))
+
+(define (dc-remove x xs)
+  (cond ((null? xs) (list)) ((equal? x (car xs)) (dc-remove x (cdr xs))) (else (cons (car xs) (dc-remove x (cdr xs))))))
+
+; Does tree t mention any name in names?
+(define (dc-mentions? t names)
+  (cond ((string? t) (dc-member? t names))
+        ((null? t) #f)
+        (else (or (dc-mentions? (car t) names) (dc-mentions? (cdr t) names)))))
+
+(define (dc-has-strlit? t)
+  (cond ((string? t) (dc-strlit? t))
+        ((null? t) #f)
+        (else (or (dc-has-strlit? (car t)) (dc-has-strlit? (cdr t))))))
+
+(define (dc-lambda? v)
+  (and (pair? v) (>= (length v) 3) (equal? (car v) "lambda") (list? (car (cdr v)))))
+
+(define (dc-int-args arity) (if (= arity 0) (list) (cons 3 (dc-int-args (- arity 1)))))
+
+(define (dc-apply p args)
+  (cond ((null? (cdr args)) (p (car args)))
+        ((null? (cdr (cdr args))) (p (car args) (car (cdr args))))
+        ((null? (cdr (cdr (cdr args)))) (p (car args) (car (cdr args)) (car (cdr (cdr args)))))
+        (else (p (car args) (car (cdr args)) (car (cdr (cdr args))) (car (cdr (cdr (cdr args))))))))
+
+; Int-callable: returns an integer for small integer arguments.
+(define (dc-int-callable? name arity)
+  (let ((r (try (dc-apply (eval name) (dc-int-args arity)) (catch (e) "error"))))
+    (integer? r)))
+
+(define (dc-leaf-candidate? name v names)
+  (and (not (dc-prefix? "sink-" name))
+       (dc-lambda? v)
+       (>= (length (car (cdr v))) 1)
+       (<= (length (car (cdr v))) 4)
+       (not (dc-mentions? (cdr (cdr v)) (dc-remove name names)))))
+
+; Candidate records (name arity numeric? lambda-src impl) from define records.
+;   impl = what a counting wrapper calls: sink-impl-NAME when the workspace
+;   keeps the original body under that name, else the lambda source inline.
+(define (discover:candidates defs)
+  (let ((names (map car defs)))
+    (let loop ((ds defs) (acc (list)))
+      (if (null? ds)
+          (dc-rev acc)
+          (let ((name (car (car ds))) (v (car (cdr (car ds)))))
+            (if (dc-leaf-candidate? name v names)
+                (let ((arity (length (car (cdr v))))
+                      (src (dc-write v))
+                      (impl-name (string-append "sink-impl-" name)))
+                  (loop (cdr ds)
+                        (cons (list name arity
+                                    (and (not (dc-has-strlit? v)) (dc-int-callable? name arity))
+                                    src
+                                    (if (dc-member? impl-name names) impl-name src))
+                              acc)))
+                (loop (cdr ds) acc)))))))
+
+; ---------------------------------------------------------------- registry
+(define discover-registry (list))  ; instrumented candidate records; slot = position
+
+(define (discover:names) (map car discover-registry))
+
+(define (discover:index name)
+  (let loop ((rs discover-registry) (i 0))
+    (cond ((null? rs) -1) ((string=? (car (car rs)) name) i) (else (loop (cdr rs) (+ i 1))))))
+
+(define (discover-find name)
+  (let loop ((rs discover-registry))
+    (cond ((null? rs) #f) ((string=? (car (car rs)) name) (car rs)) (else (loop (cdr rs))))))
+
+(define (dc-take xs k) (if (or (null? xs) (= k 0)) (list) (cons (car xs) (dc-take (cdr xs) (- k 1)))))
+
+; Hot-swap every discovered candidate into a counting wrapper, then
+; eval-current (which zeroes the window). #t when every rebind succeeded.
+(define (discover:instrument! cands)
+  (set! discover-registry (dc-take cands (discover:max-candidates)))
+  (let loop ((rs discover-registry) (i 0) (ok #t))
+    (if (null? rs)
+        (begin (eval-current) ok)
+        (let ((r (car rs)))
+          (loop (cdr rs) (+ i 1)
+                (and (equal? (counter:instrument! (car r) i (car (cdr r)) (car (cdr (cdr (cdr (cdr r)))))) #t)
+                     ok))))))
+
+; Reset, run the live workload (thunk), return name -> live calls.
+(define (discover:observe thunk)
+  (let ((at (counter:observe thunk)))
+    (lambda (name) (let ((i (discover:index name))) (if (< i 0) 0 (at i))))))
+
+(define (dc-static-calls name)
+  (let ((r (try (query:calls name) (catch (e) #f)))) (if (list? r) (length r) 0)))
+
+; Keep candidates with live calls >= min-calls; calls-of = #f means no live
+; window, keep those with a static call site instead.
+(define (discover:hot cands calls-of min-calls)
+  (cond ((null? cands) (list))
+        ((if calls-of
+             (>= (calls-of (car (car cands))) min-calls)
+             (>= (dc-static-calls (car (car cands))) 1))
+         (cons (car cands) (discover:hot (cdr cands) calls-of min-calls)))
+        (else (discover:hot (cdr cands) calls-of min-calls))))
+
+; Unary probe over the CURRENT workspace binding (resolved when built; build
+; a fresh probe after every rebind). Extra parameters are fixed at 1.
+(define (discover:probe name)
+  (let ((p (eval name)) (r (discover-find name)))
+    (let ((arity (if r (car (cdr r)) 1)))
+      (cond ((= arity 1) (lambda (x) (p x)))
+            ((= arity 2) (lambda (x) (p x 1)))
+            ((= arity 3) (lambda (x) (p x 1 1)))
+            (else (lambda (x) (p x 1 1 1)))))))
+
+; Repetitions so one measurement of (probe arg) takes >= 10 ms.
+(define (dc-calibrate probe arg)
+  (let loop ((reps 1))
+    (let ((t0 (current-time-ms)))
+      (let run ((i 0)) (if (< i reps) (begin (probe arg) (run (+ i 1))) 0))
+      (if (or (>= (- (current-time-ms) t0) 10) (>= reps 100000)) reps (loop (* reps 2))))))
+
+; identify rows (name arity numeric? index bench-arg bench-reps).
+; Non-numeric candidates are not probed with bench-arg (reps 1).
+; Plain recursion, no map / no lambda argument: on the pinned tip `map`
+; corrupts earlier results when the mapped procedure calls another procedure
+; (aura#4480), and a hand-written map taking a lambda
+; failed with "invalid closure" here.
+(define (dc-row r bench-arg)
+  (let ((name (car r)) (numeric (car (cdr (cdr r)))))
+    (list name (car (cdr r)) numeric (discover:index name) bench-arg
+          (if numeric (dc-calibrate (discover:probe name) bench-arg) 1))))
+
+(define (discover:rows cands bench-arg)
+  (if (null? cands)
+      (list)
+      (cons (dc-row (car cands) bench-arg) (discover:rows (cdr cands) bench-arg))))
+
+(define (discover:print cands)
+  (if (null? cands)
+      #t
+      (let ((r (car cands)))
+        (display "  ") (display (car r)) (display "  arity=") (display (car (cdr r)))
+        (display "  int-callable=") (display (car (cdr (cdr r))))
+        (display "  slot=") (display (discover:index (car r))) (newline)
+        (discover:print (cdr cands)))))

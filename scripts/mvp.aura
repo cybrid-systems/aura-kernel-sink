@@ -8,6 +8,7 @@
 (require "loop" all:)
 (require "counter" all:)
 (require "harness" all:)
+(require "discover" all:)
 (require "std/hot-strategy" all:)
 (display "RUN-ONCE") (newline)  ; run_tests.sh fails if this prints twice (silent file re-run)
 
@@ -20,8 +21,12 @@
 (set-code (fixture:workspace-code))
 (eval-current)
 (display "-- 0b. instrument candidates (mutate:rebind -> counting wrappers), run live workload") (newline)
-(define instrumented (fixture:instrument!))
-(define live (fixture:observe "hot" 400))
+; Automatic discovery: candidates come from the workspace (query:code), not a list.
+(define discovered (discover:candidates (discover:defines (discover:scan))))
+(display "  discovered:") (newline) (discover:print discovered)
+(define instrumented (discover:instrument! discovered))
+(define live (discover:observe (lambda () (app-workload 400 #t))))
+(define rows (discover:rows (discover:hot discovered live 1) 5000))
 (display "  live calls: hot-sum-sq=") (display (live "hot-sum-sq"))
 (display " cold-add=") (display (live "cold-add"))
 (display " label-of=") (display (live "label-of")) (newline)
@@ -29,7 +34,7 @@
 ; 1. Identify. The policy is the workspace define sink-policy.
 (define policy (lambda (calls ms numeric) (sink-policy calls ms numeric)))
 (display "-- 1. identify (policy = workspace sink-policy)") (newline)
-(define records (identify:run (fixture:candidates) fixture:probe policy live))
+(define records (identify:run rows discover:probe policy live))
 (identify:print records)
 (define selected (identify:selected records))
 (display "  selected: ") (display selected) (newline)
@@ -38,7 +43,7 @@
 (display "-- 1b. hot-swap sink-policy (budget 50 ms -> 1e9 ms), re-identify, restore") (newline)
 (mutate:rebind "sink-policy" (fixture:policy-body 1000000000 50) "raise budget")
 (eval-current)
-(display "  selected: ") (display (identify:selected (identify:run (fixture:candidates) fixture:probe policy live))) (newline)
+(display "  selected: ") (display (identify:selected (identify:run rows discover:probe policy live))) (newline)
 (mutate:rebind "sink-policy" (fixture:policy-body 50 50) "restore budget")
 (eval-current)
 

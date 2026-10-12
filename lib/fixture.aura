@@ -33,6 +33,7 @@
 
 (require "sink_plan" all:)
 (require "counter" all:)
+(require "discover" all:)
 
 (define (fixture:aura-body name)
   (cond
@@ -63,7 +64,7 @@
    "(define label-of " (fixture:aura-body "label-of") ")\n"
    (fixture:policy-define 50 50)
    "(define (sink-min-speedup) 2)\n"
-   (counter:workspace-code 3)
+   (counter:workspace-code (discover:max-candidates))
    ; Original bodies under a second name: the counting wrapper calls these, so
    ; the counted baseline costs tick + one call, the same as the counted sink
    ; wrapper (an inline ((lambda ...) a0) would allocate a closure per call and
@@ -76,7 +77,8 @@
 
 ; Counter slot of each candidate in sink-calls.
 (define (fixture:index name)
-  (cond ((string=? name "hot-sum-sq") 0)
+  (cond ((>= (discover:index name) 0) (discover:index name))
+        ((string=? name "hot-sum-sq") 0)
         ((string=? name "cold-add") 1)
         ((string=? name "label-of") 2)
         (else -1)))

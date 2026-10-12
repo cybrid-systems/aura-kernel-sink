@@ -1,9 +1,10 @@
 # aura-kernel-sink state (machine-readable, key=value)
 aura_repo=https://github.com/cybrid-systems/aura
-aura_tip=94ca96362dc7851f6e1ef6f8cc0979afa1f45ed8  # pinned 2026-10-12
+aura_tip=d89d39c56  # pinned 2026-10-12 (includes #4473)
 aura_build=RelWithDebInfo
 aura_face=soft  # AURA_SANDBOX=off AURA_PIPELINE_STRICT=0; default Restricted face cannot load the std prelude on this tip
 
+discover=real        # lib/discover.aura: candidates from (query:code) workspace defines; leaf + fixed arity 1..4 + Int-callable probe; sink-* excluded; live calls >= min-calls (or static query:calls sites without a live window); max 8 slots
 identify=real        # live call counts x measured ms/call + query:calls sites; decision = workspace sink-policy (hot-swappable)
 call_profile=live-interim # lib/counter.aura: mutate:rebind counting wrappers + workspace sink-calls vector; window resets on eval-current; no native per-define counter in Aura yet
 kernel_gen=manual    # kernels/*.c hand-written
@@ -16,8 +17,8 @@ score=real           # correctness + determinism + speedup >= (sink-min-speedup)
 rollback=real        # hot-strategy:heal! (ast:restore + eval-current) + golden re-check
 fake_plant=real      # SINK_PLANT=fake runs the same loop with Aura stand-in bodies
 
-tests=tests/test_identify.aura tests/test_score.aura tests/test_loop_real.aura tests/test_loop_fake.aura  # 112 checks
+tests=tests/test_discover.aura tests/test_identify.aura tests/test_score.aura tests/test_loop_real.aura tests/test_loop_fake.aura  # 142 checks
 mvp=scripts/run_mvp.sh  # 8 checks, real and fake plant
 
-aura_issues_filed=4475,4476,4477,4478,4479  # float literal->0 in workspace bodies; atomic-batch file re-run + define unbound; primitive shadow lost after eval-current; cannot-call re-run + silent non-procedure apply; 9+ workspace procedure defines -> ~35x slower calls
-next=native per-define call counter (replace interim wrappers); auto-discover candidates; kernel generator; Float ABI kernels; switch to atomic-batch when fixed; Restricted face with effect:ffi
+aura_issues_filed=4475,4476,4477,4478,4479,4480  # (4480: map corrupts earlier results when the mapped proc calls another proc); float literal->0 in workspace bodies; atomic-batch file re-run + define unbound; primitive shadow lost after eval-current; cannot-call re-run + silent non-procedure apply; 9+ workspace procedure defines -> ~35x slower calls
+next=native per-define call counter (replace interim wrappers); kernel generator; Float ABI kernels; switch to atomic-batch when fixed; Restricted face with effect:ffi
