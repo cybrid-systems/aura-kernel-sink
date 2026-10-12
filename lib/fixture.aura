@@ -121,8 +121,13 @@
    "(define ov-div (lambda (a b) (/ a b)))\n"
    "(define ov-qmin (lambda (b) (quotient (- (- 0 4611686018427387903) 1) b)))\n"
    "(define ov-qloop (lambda (n d) (letrec ((lp (lambda (n k) (if (> n 0) (lp (quotient n d) (+ k 1)) k)))) (lp n 0))))\n"
+   "(define ov-rem (lambda (a b) (remainder a b)))\n"
+   "(define ov-mod (lambda (a b) (modulo a b)))\n"
+   "(define ov-rmin (lambda (b) (remainder (- (- 0 4611686018427387903) 1) b)))\n"
+   "(define ov-mmin (lambda (b) (modulo (- (- 0 4611686018427387903) 1) b)))\n"
+   "(define ov-gcd (lambda (a b) (letrec ((lp (lambda (a b) (if (= b 0) a (lp b (remainder a b)))))) (lp a b))))\n"
    "(define ov-pow (lambda (b k) (letrec ((lp (lambda (i acc) (if (< i k) (lp (+ i 1) (* acc b)) acc)))) (lp 0 1))))\n"))
-(define (fixture:overflow-names) (list "ov-add" "ov-sub" "ov-mul" "ov-neg" "ov-chain" "ov-pow" "ov-quo" "ov-div" "ov-qmin" "ov-qloop"))
+(define (fixture:overflow-names) (list "ov-add" "ov-sub" "ov-mul" "ov-neg" "ov-chain" "ov-pow" "ov-quo" "ov-div" "ov-qmin" "ov-qloop" "ov-rem" "ov-mod" "ov-rmin" "ov-mmin" "ov-gcd"))
 
 ; c-func scalar kind of a fixture candidate.
 (define (fixture:kind name) (if (string=? name "hot-fsum") "Float" "Int"))

@@ -1,0 +1,83 @@
+;; tests/test_kgen_remmod.aura — checked Int remainder / modulo in generated kernels.
+;; In range: kernel == Aura Soft for every sign combination.
+;;   remainder: truncating, sign of the dividend (C99 %).
+;;   modulo: the pinned Soft returns a NON-NEGATIVE result (r<0 -> r+|b|),
+;;   e.g. (modulo 7 -2) = 1 where R7RS floor modulo gives -1 (aura#4486). The
+;;   kernel matches Soft (AURA_SINK_MODULO_FLOOR=0 default).
+;; Div by zero: Soft raises a catchable error; the kernel never executes %,
+;; returns 0 with status bit 2 and the wrapper raises an Aura error.
+;; b == -1: always 0 on both sides (Soft returns 0 for -2^62 % -1 too); the
+;; kernel never executes % there, so INT64_MIN % -1 (C UB) cannot run.
+(require "expect" all:)
+(require "fixture" all:)
+(require "kgen" all:)
+(require "sink_plan" all:)
+(require "std/ffi" all:)
+(display "RUN-ONCE") (newline)
+
+(define (has-sub? s sub)
+  (let ((n (string-length s)) (m (string-length sub)))
+    (let loop ((i 0)) (cond ((> (+ i m) n) #f) ((string=? (substring s i (+ i m)) sub) #t) (else (loop (+ i 1)))))))
+
+(define (ov-rem a b) (remainder a b))
+(define (ov-mod a b) (modulo a b))
+(define (ov-rmin b) (remainder (- (- 0 4611686018427387903) 1) b))
+(define (ov-mmin b) (modulo (- (- 0 4611686018427387903) 1) b))
+(define (ov-gcd a b) (let lp ((a a) (b b)) (if (= b 0) a (lp b (remainder a b)))))
+
+(define (kern name sig)
+  (let ((lib (c-load (fixture:so (kgen:base name)))))
+    (list (c-func lib (kgen:symbol name) sig)
+          (c-func lib (string-append (kgen:symbol name) "_overflowed") "() -> Int"))))
+(define (k-f k) (car k))
+(define (k-o k) (car (cdr k)))
+(define krem (kern "ov-rem" "(Int Int) -> Int"))
+(define kmod (kern "ov-mod" "(Int Int) -> Int"))
+(define krmin (kern "ov-rmin" "(Int) -> Int"))
+(define kmmin (kern "ov-mmin" "(Int) -> Int"))
+(define kgcd (kern "ov-gcd" "(Int Int) -> Int"))
+(expect "remainder/modulo kernels built and resolve"
+        (and (procedure? (k-f krem)) (procedure? (k-f kmod)) (procedure? (k-f krmin)) (procedure? (k-f kmmin)) (procedure? (k-o kgcd))))
+
+(define (same2 k ref a b) (let ((r ((k-f k) a b))) (and (= ((k-o k)) 0) (= r (ref a b)))))
+(define (same1 k ref a) (let ((r ((k-f k) a))) (and (= ((k-o k)) 0) (= r (ref a)))))
+(define (st2 k a b want) (let ((r ((k-f k) a b))) (let ((o ((k-o k)))) (and (= r 0) (= o want) (= ((k-o k)) 0)))))
+(define fmax 4611686018427387903)
+(define nedge -4503599627370496)
+(define (all-signs k ref)
+  (and (same2 k ref 7 2) (same2 k ref -7 2) (same2 k ref 7 -2) (same2 k ref -7 -2)
+       (same2 k ref 9 4) (same2 k ref -9 4) (same2 k ref 9 -4) (same2 k ref -9 -4)
+       (same2 k ref 6 3) (same2 k ref -6 3) (same2 k ref 6 -3) (same2 k ref -6 -3)
+       (same2 k ref 0 5) (same2 k ref 0 -5) (same2 k ref 3 7) (same2 k ref -3 7) (same2 k ref 3 -7) (same2 k ref -3 -7)))
+
+(expect "golden remainder: all sign combos == Aura" (all-signs krem ov-rem))
+(expect "golden modulo: all sign combos == Aura" (all-signs kmod ov-mod))
+(expect "remainder sign follows the dividend" (and (= ((k-f krem) -7 2) -1) (= ((k-f krem) 7 -2) 1)))
+(expect "modulo on the pinned Soft is non-negative (kernel matches; aura#4486)"
+        (and (= (ov-mod 7 -2) 1) (= ((k-f kmod) 7 -2) 1) (= (ov-mod -7 -2) 1) (= ((k-f kmod) -7 -2) 1) (= ((k-f kmod) -7 2) 1)))
+(expect "golden remainder edges == Aura"
+        (and (same2 krem ov-rem fmax 2) (same2 krem ov-rem fmax -7) (same2 krem ov-rem fmax fmax) (same2 krem ov-rem nedge 7) (same2 krem ov-rem nedge -1) (same2 krem ov-rem 3 fmax) (same2 krem ov-rem fmax -1)))
+(expect "golden modulo edges == Aura"
+        (and (same2 kmod ov-mod fmax 2) (same2 kmod ov-mod fmax -7) (same2 kmod ov-mod nedge 7) (same2 kmod ov-mod nedge -7) (same2 kmod ov-mod -3 fmax) (same2 kmod ov-mod fmax -1) (same2 kmod ov-mod -5 -1)))
+(expect "-2^62 dividend == Aura (remainder/modulo by 7, -7, 1000000)"
+        (and (same1 krmin ov-rmin 7) (same1 krmin ov-rmin -7) (same1 krmin ov-rmin 1000000) (same1 kmmin ov-mmin 7) (same1 kmmin ov-mmin -7) (same1 kmmin ov-mmin 1000000)))
+(expect "MIN % -1: 0 on both sides, no % executed, status clean"
+        (and (same1 krmin ov-rmin -1) (same1 kmmin ov-mmin -1) (= ((k-f krmin) -1) 0)))
+(expect "golden gcd loop (remainder in a tail loop) == Aura"
+        (and (same2 kgcd ov-gcd 1071 462) (same2 kgcd ov-gcd 1000000007 998244353) (same2 kgcd ov-gcd fmax 6) (same2 kgcd ov-gcd 17 0)))
+
+(define (caught? thunk) (let ((v (try (thunk) (catch (e) (list "caught" e))))) (and (pair? v) (equal? (car v) "caught"))))
+(expect "Aura Soft: (remainder a 0) is a catchable error" (caught? (lambda () (ov-rem 5 (- 2 2)))))
+(expect "Aura Soft: (modulo a 0) is a catchable error" (caught? (lambda () (ov-mod 5 (- 2 2)))))
+(expect "div0 remainder: fail closed, status=2" (and (st2 krem 5 0 2) (st2 krem -5 0 2) (st2 krem 0 0 2) (st2 krem fmax 0 2)))
+(expect "div0 modulo: fail closed, status=2" (and (st2 kmod 5 0 2) (st2 kmod -5 0 2) (st2 kmod 0 0 2)))
+(expect "status per call: next in-range call clean" (and (same2 krem ov-rem -9 4) (same2 kmod ov-mod -9 4)))
+
+(define p-m (sink-plan:make "ov-mod" "x.so" (kgen:symbol "ov-mod") 2 "" ""))
+(expect "plan: generated modulo kernel is checked; error text says overflow/div0"
+        (and (sink-plan:checked? p-m) (has-sub? (sink-plan:bind-body p-m 3) "(error \"sink: int overflow/div0 in ov-mod")))
+(define (wrapped a b)
+  (let ((r ((k-f kmod) a b)))
+    (if (= ((k-o kmod)) 0) r (error "sink: int overflow/div0 in ov-mod"))))
+(expect "wrapper: div0 raises an Aura error, kernel usable after" (and (caught? (lambda () (wrapped 1 0))) (= (wrapped -7 3) (ov-mod -7 3))))
+(expect-summary)

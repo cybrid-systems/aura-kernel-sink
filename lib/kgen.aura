@@ -125,6 +125,12 @@
               (loop (cdr xs) (if first (kg-val r) (string-append "sink_ck_quo(" acc ", " (kg-val r) ", &ovf)")) #f)
               r)))))
 
+; (remainder a b) / (modulo a b): exactly 2 args, divisor checked before %
+(define (kg-divop fn args env loops)
+  (let ((a (kg-expr (car args) env loops)) (b (kg-expr (car (cdr args)) env loops)))
+    (cond ((not (kg-ok? a)) a) ((not (kg-ok? b)) b)
+          (else (kg-ok (string-append fn "(" (kg-val a) ", " (kg-val b) ", &ovf)"))))))
+
 (define (kg-expr t env loops)
   (cond
     ((string? t)
@@ -162,8 +168,10 @@
          ; Int quotient / Int `/` (Aura truncates both): checked, divisor tested before `/`
          ((and (not kg-float-mode) (string=? h "quotient") (= (kg-len args) 2)) (kg-quo args env loops))
          ((and (not kg-float-mode) (string=? h "/") (> (kg-len args) 1)) (kg-quo args env loops))
+         ((and (not kg-float-mode) (string=? h "remainder") (= (kg-len args) 2)) (kg-divop "sink_ck_rem" args env loops))
+         ((and (not kg-float-mode) (string=? h "modulo") (= (kg-len args) 2)) (kg-divop "sink_ck_mod" args env loops))
          ((or (string=? h "quotient") (string=? h "remainder") (string=? h "modulo") (string=? h "/"))
-          (kg-err (string-append "division " h " unsupported (only Int quotient and Int / with 2+ args)")))
+          (kg-err (string-append "division " h " unsupported (only Int quotient/remainder/modulo with 2 args and Int / with 2+ args)")))
          (else (kg-err (string-append "unsupported call " h))))))))
 
 (define (kg-cmp? h) (or (string=? h "<") (string=? h ">") (string=? h "<=") (string=? h ">=") (string=? h "=")))

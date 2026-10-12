@@ -47,8 +47,12 @@
         (has-sub? (reason (gen "(define fact (lambda (n) (if (< n 2) 1 (* n (fact (- n 1))))))" "fact")) "non-tail"))
 (expect "kgen quotient: generated, divisor checked before /"
         (let ((r (gen "(define half (lambda (n) (quotient n 2)))" "half"))) (and (ok? r) (has-sub? (reason r) "sink_ck_quo("))))
-(expect "kgen remainder: still skipped"
-        (has-sub? (reason (gen "(define rm (lambda (n) (remainder n 2)))" "rm")) "division"))
+(expect "kgen remainder: generated, sink_ck_rem"
+        (let ((r (gen "(define rm (lambda (n) (remainder n 2)))" "rm"))) (and (ok? r) (has-sub? (reason r) "sink_ck_rem("))))
+(expect "kgen modulo: generated, sink_ck_mod"
+        (let ((r (gen "(define md (lambda (n) (modulo n 3)))" "md"))) (and (ok? r) (has-sub? (reason r) "sink_ck_mod("))))
+(expect "kgen remainder with 3 args: skipped with a reason"
+        (has-sub? (reason (gen "(define rm3 (lambda (n) (remainder n 2 3)))" "rm3")) "division"))
 (expect "kgen unary /: skipped"
         (has-sub? (reason (gen "(define inv (lambda (n) (/ n)))" "inv")) "division"))
 (expect "kgen float literal: skipped"
