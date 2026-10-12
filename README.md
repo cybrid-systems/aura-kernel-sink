@@ -82,13 +82,17 @@ checks: 8 passed, 0 failed
 
 不再有手写候选清单。`discover:scan` 读 `(query:code)`（规范化后的工作区源码），解析出每个顶层 `(define NAME (lambda ...))`，按以下规则筛选：不在 `sink-*` 命名空间；叶子函数（函数体不引用其他工作区 define，C kernel 无法回调 Aura，所以 `app-workload` 这类驱动函数被排除）；固定 1–4 个参数；用小整数实际调用一次返回整数（Int-callable，`label-of` 因返回字符串被排除）。发现的集合经 `discover:instrument!` 自动换成计数包装（槽位按工作区顺序，最多 8 个），跑完活负载后 `discover:hot` 只保留调用数 ≥ 阈值的（没有活窗口时退回到 `query:calls` 静态调用点 ≥1）。`discover:rows` 生成 identify 行（自动标定重复次数），最终决策仍由可热换的 `sink-policy` 做。新加一个 define 不用改任何清单就能被发现。
 
+### C kernel 生成器（`lib/kgen.aura`）
+
+`scripts/gen_kernel.sh` 对发现出的候选逐个生成 C：读 `(query:code)` 里的 define 树，支持整数字面量、参数、`+ - *`、`if`、比较/`and`/`or`/`not` 条件、对自身或 `letrec` 循环（named let 规范化后的形式）的尾调用（编译成 `goto`）。生成 `int64_t` 代码，用 `-fwrapv` 编进 `build/kernels/libgen_<name>.so`，导出 `sink_gen_<name>`，带 `aot_emit_version`，直接走现有 `aot:reload` + `c-func` + `mutate:rebind` + 评分闭环。字符串/浮点/布尔值、调用其他函数、非尾递归、除法（Aura 除零语义）、`begin`/`set!`、把整数当条件（真值语义不同）一律跳过并给出原因，不会生成可疑 kernel。示例：`hot-sum-sq`、`cold-add` 生成成功，`label-of` 因字符串字面量跳过。MVP 先试生成版，生成版被拒才回退手写版；实测生成版加速约 29×，与手写版逐点一致。
+
 ### 什么是真的，什么是替身
 
 | 步骤 | 状态 |
 |---|---|
 | 识别：实测 ms/call、`query:calls` 调用点、workspace 策略决策、策略热替换 | **真跑** |
 | 调用次数画像 | **真跑（过渡实现）**：`mutate:rebind` 把候选换成计数包装，计数器在 workspace 的 `sink-calls` 向量里；Aura 还没有原生按 define 的调用计数，见 IMPROVEMENTS |
-| 生成 C kernel | **手写**（`kernels/*.c`；生成器是后续项） |
+| 生成 C kernel | **真跑（最小子集）**：`lib/kgen.aura` 从工作区 define 的 AST 生成 `build/gen/gen_<name>.c`；不支持的函数体带原因跳过；手写 `kernels/*.c` 保留为回退 |
 | 编译 `.so` | **真跑**（`kernels/build.sh`，`cc -O2 -shared -fPIC`） |
 | `aot:reload` 加载 | **真跑**，Soft 面返回 `#t`、走 staging + epoch bump；但 kernel 不是 Aura AOT 模块，调用路径走 `c-func` |
 | `c-load` + `c-func` 绑定 | **真跑** |
@@ -102,6 +106,7 @@ checks: 8 passed, 0 failed
 - [#4475](https://github.com/cybrid-systems/aura/issues/4475)：workspace 过程体里的浮点字面量变成 `0`（策略阈值 `0.05` 失效）→ 本仓库 workspace 常量只用整数。
 - [#4476](https://github.com/cybrid-systems/aura/issues/4476)：两步 `mutate:atomic-batch` + `ast:restore` 在一个顶层 form 里会让整个文件静默重跑；`(define x (mutate:atomic-batch …))` 后 `x` 未绑定 → 默认用两次 `mutate:rebind`，结果用 `set!` 存。
 - [#4477](https://github.com/cybrid-systems/aura/issues/4477)：与原语同名的用户 define（`check`）在 `eval-current` 后被原语顶掉 → 测试助手改名 `expect`。
+- [#4481](https://github.com/cybrid-systems/aura/issues/4481)：把 plant（含闭包）内联作为参数传给执行 register!/rebind/eval-current 的顶层 form 时报 `cannot call: ''` 且整文件静默重跑 → plant 先绑到顶层 define。
 - [#4478](https://github.com/cybrid-systems/aura/issues/4478)：顶层 `cannot call` 会重跑前面的 form（#4355 残留）；`(5 5)` 静默返回 → `c-func` 绑定前先 `procedure?` 探测。
 
 更多 API 缺口和后续计划见 [IMPROVEMENTS.md](IMPROVEMENTS.md)。
@@ -138,9 +143,10 @@ MVP, pinned to Aura `c4fc6cf23` (RelWithDebInfo, Soft face:
 | `lib/loop.aura` | one attempt: register! → load → rebind slot + wrapper → eval-current → score → accept / heal! + golden re-check |
 | `lib/fixture.aura` | toy workspace: `hot-sum-sq` (hot loop), `cold-add` (trivial), `label-of` (strings), policy, counters, `app-workload` (the live traffic) |
 | `lib/harness.aura`, `lib/expect.aura` | shared attempt runner, PASS/FAIL helper |
-| `kernels/` | `sum_sq.c` (good), `example_add.c` (trivial), `bad_wrong.c`, `bad_slow.c`, `build.sh` |
-| `scripts/` | `env.sh`, `run_mvp.sh`, `run_tests.sh`, `mvp.aura` |
-| `tests/` | `test_identify`, `test_score`, `test_loop_real`, `test_loop_fake` (112 checks) |
+| `lib/kgen.aura` | C kernel generator: define AST -> `int64_t` C, or skip with a reason |
+| `kernels/` | hand-written fallback `sum_sq.c` (good), `example_add.c` (trivial), `bad_wrong.c`, `bad_slow.c`; `build.sh` builds these and `build/gen/*.c` |
+| `scripts/` | `env.sh`, `run_mvp.sh`, `run_tests.sh`, `mvp.aura`, `gen_kernel.sh` + `kgen.aura` (generate + build) |
+| `tests/` | `test_discover`, `test_identify`, `test_kgen`, `test_score`, `test_loop_real`, `test_loop_fake` (170 checks) |
 | `probes/` | minimal repros of the Aura bugs found while building this |
 
 ### Run
@@ -149,7 +155,8 @@ MVP, pinned to Aura `c4fc6cf23` (RelWithDebInfo, Soft face:
 export AURA_BIN=~/aura/build-rel/aura      # an Aura build; AURA_LIB defaults to <checkout>/lib
 scripts/run_mvp.sh                         # end to end with real .so files (RealPlant)
 SINK_PLANT=fake scripts/run_mvp.sh         # same loop, Aura stand-in data plane
-scripts/run_tests.sh                       # 4 test files, 95 checks
+scripts/gen_kernel.sh                      # generate build/gen/*.c + build .so (run_* call it)
+scripts/run_tests.sh                       # 6 test files, 170 checks
 ```
 
 The runner fails a test file on a FAIL line, a crash, a non-zero exit, an error
@@ -161,13 +168,17 @@ mutation).
 
 No hand-written candidate list: `discover:scan` reads `(query:code)`, keeps top-level `(define NAME (lambda ...))` forms that are outside `sink-*`, leaves (body names no other workspace define), fixed arity 1..4, and Int-callable (a probe call with small integers returns an integer). `discover:instrument!` swaps them into counting wrappers (slots in workspace order, max 8), `discover:hot` keeps those with live calls >= min-calls (static `query:calls` sites when no live window), and `discover:rows` feeds identify; the decision is still the hot-swappable `sink-policy`. `scripts/mvp.aura` uses the discovered set.
 
+### C kernel generator (`lib/kgen.aura`)
+
+`scripts/gen_kernel.sh` generates C for each discovered candidate from its `(query:code)` define tree. Subset: integer literals, parameters, `+ - *`, `if`, comparison / `and` / `or` / `not` conditions, and tail calls to the define itself or to a `letrec` loop (what named let desugars to), compiled to `goto`. Output is `int64_t` C built with `-fwrapv` into `build/kernels/libgen_<name>.so`, exporting `sink_gen_<name>` plus `aot_emit_version`, so it goes through the existing `aot:reload` + `c-func` + `mutate:rebind` + score loop unchanged. Strings, floats, boolean values, calls to other procedures, non-tail recursion, division (Aura's divide-by-zero semantics), `begin`/`set!`, and Int-as-condition (truthiness differs) are skipped with a reason — never a guessed kernel. On the fixture `hot-sum-sq` and `cold-add` generate, `label-of` is skipped (string literal). The MVP tries the generated kernel first and falls back to the hand-written one only if it is rejected; measured ~29x, identical to the hand-written kernel on all cases.
+
 ### What runs for real vs stubbed
 
 | step | status |
 |---|---|
 | identify: measured ms/call, `query:calls` call sites, workspace-policy decision, policy hot-swap | **real** |
 | per-function call counts | **real, interim**: candidates hot-swapped (`mutate:rebind`) into counting wrappers; counts live in the workspace vector `sink-calls`, read after a workload run (`lib/counter.aura`). Not a VM counter: Aura has none per define yet |
-| C kernel generation | **hand-written** (`kernels/*.c`; generator is future work) |
+| C kernel generation | **real, minimal subset**: `lib/kgen.aura` emits `build/gen/gen_<name>.c` from the workspace define's AST; unsupported bodies are skipped with a reason; hand-written `kernels/*.c` stay as fallback |
 | build `.so` | **real** (`kernels/build.sh`) |
 | `aot:reload` | **real**; returns `#t` on Soft with staging + epoch bump. The kernel is not an Aura AOT module, so calls go through `c-func` |
 | `c-load` + `c-func` binding | **real** |

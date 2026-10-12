@@ -6,6 +6,6 @@
 set -euo pipefail
 source "$(dirname "$0")/env.sh"
 cd "$REPO_ROOT"
-"$REPO_ROOT/kernels/build.sh"
+"$REPO_ROOT/scripts/gen_kernel.sh"
 export SINK_PLANT="${SINK_PLANT:-real}"
 exec "$AURA_BIN" "$REPO_ROOT/scripts/mvp.aura"

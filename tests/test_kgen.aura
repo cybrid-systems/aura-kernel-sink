@@ -1,0 +1,94 @@
+; tests/test_kgen.aura — the C kernel generator (lib/kgen.aura):
+; supported subset generates, everything else is skipped with a reason, the
+; generated hot-sum-sq kernel matches the hand-written one and the Aura body,
+; and the closed loop accepts it with a speedup.
+; run_tests.sh runs scripts/gen_kernel.sh first (build/kernels/libgen_*.so).
+(require "expect" all:)
+(require "fixture" all:)
+(require "discover" all:)
+(require "kgen" all:)
+(require "plant" all:)
+(require "loop" all:)
+(require "harness" all:)
+(require "std/ffi" all:)
+(require "std/fs" all:)
+(require "std/hot-strategy" all:)
+(display "RUN-ONCE") (newline)  ; run_tests.sh fails if this prints twice (silent file re-run)
+
+; Plant made at top level: a plant built inline in the attempt form fails with
+; "cannot call" + a silent file re-run on this tip (see IMPROVEMENTS.md).
+(define plant (plant:real))
+
+(define (has-sub? s sub)
+  (let ((n (string-length s)) (m (string-length sub)))
+    (let loop ((i 0)) (cond ((> (+ i m) n) #f) ((string=? (substring s i (+ i m)) sub) #t) (else (loop (+ i 1)))))))
+(define (gen src name) (kgen:compile name (car (cdr (car (discover:defines (discover:read src)))))))
+(define (ok? r) (equal? (car r) #t))
+(define (reason r) (car (cdr r)))
+
+; ---- static: subset and skip reasons (trees from the same reader discover uses)
+(define r-hot (gen "(define hot-sum-sq (lambda (n) (letrec ((loop (lambda (i s) (if (< i n) (loop (+ i 1) (+ s (* i i))) s)))) (loop 0 0))))" "hot-sum-sq"))
+(expect "kgen hot-sum-sq: generated" (ok? r-hot))
+(expect "kgen hot-sum-sq: exports sink_gen_hot_sum_sq(long a0)" (has-sub? (reason r-hot) "long sink_gen_hot_sum_sq(long a0)"))
+(expect "kgen hot-sum-sq: loop -> goto, s += i*i" (and (has-sub? (reason r-hot) "goto top_") (has-sub? (reason r-hot) "(l2_0 * l2_0)")))
+(expect "kgen hot-sum-sq: carries aot_emit_version (AURA_SINK_MODULE)" (has-sub? (reason r-hot) "AURA_SINK_MODULE"))
+(expect "kgen cold-add: generated, 2 params" (has-sub? (reason (gen "(define cold-add (lambda (a b) (+ a b)))" "cold-add")) "(long a0, long a1)"))
+(expect "kgen tail self-recursion: generated as goto top_0"
+        (has-sub? (reason (gen "(define cnt (lambda (n acc) (if (<= n 0) acc (cnt (- n 1) (+ acc 2)))))" "cnt")) "goto top_0"))
+(expect "kgen if-expression + and/not: generated"
+        (ok? (gen "(define clamp (lambda (x) (if (and (> x 0) (not (> x 10))) x 0)))" "clamp")))
+
+(define r-label (gen "(define label-of (lambda (n) (if (> n 0) \"pos\" \"non-pos\")))" "label-of"))
+(expect "kgen label-of: skipped" (not (ok? r-label)))
+(expect "kgen label-of: reason string literal" (has-sub? (reason r-label) "string literal"))
+(expect "kgen non-tail recursion (fact): skipped"
+        (has-sub? (reason (gen "(define fact (lambda (n) (if (< n 2) 1 (* n (fact (- n 1))))))" "fact")) "non-tail"))
+(expect "kgen quotient: skipped (Aura error on 0)"
+        (has-sub? (reason (gen "(define half (lambda (n) (quotient n 2)))" "half")) "division"))
+(expect "kgen float literal: skipped"
+        (has-sub? (reason (gen "(define fl (lambda (x) (* x 1.5)))" "fl")) "non-integer"))
+(expect "kgen call into another define: skipped"
+        (has-sub? (reason (gen "(define g (lambda (x) (h x)))" "g")) "unsupported call h"))
+(expect "kgen Int used as condition: skipped (truthiness differs)"
+        (not (ok? (gen "(define t (lambda (x) (if x 1 2)))" "t"))))
+(expect "kgen begin body: skipped"
+        (has-sub? (reason (gen "(define b (lambda (x) (begin (display x) x)))" "b")) "begin"))
+(expect "kgen boolean result: skipped"
+        (has-sub? (reason (gen "(define p (lambda (x) #t))" "p")) "boolean"))
+
+; ---- from the live workspace: discovered candidates -> emit
+(set-code (fixture:workspace-code))
+(eval-current)
+(define defs (discover:defines (discover:scan)))
+(define rows (kgen:emit! defs (list "hot-sum-sq" "label-of") "/tmp"))
+(expect "kgen:emit! hot-sum-sq from workspace: generated"
+        (string=? (car (cdr (car rows))) "generated"))
+(expect "kgen:emit! label-of from workspace: skipped with reason"
+        (and (string=? (car (cdr (car (cdr rows)))) "skipped")
+             (has-sub? (car (cdr (cdr (car (cdr rows))))) "string literal")))
+(expect "kgen:emit! wrote /tmp/gen_hot_sum_sq.c" (file-exists? "/tmp/gen_hot_sum_sq.c"))
+(expect "gen_kernel.sh built libgen_hot_sum_sq.so" (file-exists? (fixture:so (kgen:base "hot-sum-sq"))))
+(expect "label-of has no generated .so" (not (file-exists? (fixture:so (kgen:base "label-of")))))
+
+; ---- semantics: generated == hand-written == Aura body
+(define gen-lib (c-load (fixture:so (kgen:base "hot-sum-sq"))))
+(define hand-lib (c-load (fixture:so "sum_sq")))
+(define gen-f (c-func gen-lib "sink_gen_hot_sum_sq" "(Int) -> Int"))
+(define hand-f (c-func hand-lib "sink_sum_sq" "(Int) -> Int"))
+(expect "generated symbol resolves" (procedure? gen-f))
+(define (same-all? xs)
+  (cond ((null? xs) #t)
+        ((and (= (gen-f (car xs)) (hand-f (car xs))) (= (gen-f (car xs)) (hot-sum-sq (car xs)))) (same-all? (cdr xs)))
+        (else (display "  mismatch at ") (display (car xs)) (newline) #f)))
+(expect "generated == hand-written == Aura on golden + edge cases"
+        (same-all? (append (fixture:cases "hot-sum-sq") (list -7 -1 7 333 12345))))
+
+; ---- closed loop: generated kernel through aot:reload + c-func + mutate:rebind + score
+(expect "real: candidates instrumented" (fixture:instrument!))
+(define r #f)
+(set! r (harness:attempt plant "hot-sum-sq" "generated" (sink-min-speedup)))
+(expect "loop: generated kernel accepted" (loop:accepted? r))
+(expect "loop: speedup >= sink-min-speedup" (>= (loop:speedup r) (sink-min-speedup)))
+(expect "loop: sunk hot-sum-sq correct" (= (hot-sum-sq 100) 328350))
+(expect "loop: sunk hot-sum-sq still counted" (= ((fixture:observe "hot" 3) "hot-sum-sq") 3))
+(expect-summary)

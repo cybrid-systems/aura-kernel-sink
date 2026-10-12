@@ -1,0 +1,24 @@
+; probes/inline_plant_cannot_call.aura — run from the repo root with
+; scripts/env.sh sourced (AURA_SANDBOX=off AURA_PIPELINE_STRICT=0), after
+; kernels/build.sh. Aura d89d39c56.
+;
+; A plant (list of closures from a required module) built INLINE as an argument
+; of the top-level form that runs the sink attempt (mutate:rebind +
+; eval-current + hot-strategy:register!) fails with
+;   error: type error: cannot call:
+;     did you forget to define ''?
+; and the whole file is silently re-run (START prints twice).
+; Binding the same value to a top-level define first works (accept, 30x).
+(require "fixture" all:)
+(require "plant" all:)
+(require "loop" all:)
+(require "harness" all:)
+(require "std/hot-strategy" all:)
+(display "START") (newline)
+(set-code (fixture:workspace-code))
+(eval-current)
+; WORKS:  (define p (plant:real)) (define r #f) (set! r (harness:attempt p "hot-sum-sq" "good" 2))
+; FAILS:
+(define r #f)
+(set! r (harness:attempt (plant:real) "hot-sum-sq" "good" 2))
+(display (loop:verdict r)) (newline)

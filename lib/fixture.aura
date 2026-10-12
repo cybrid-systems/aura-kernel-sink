@@ -34,6 +34,7 @@
 (require "sink_plan" all:)
 (require "counter" all:)
 (require "discover" all:)
+(require "kgen" all:)
 
 (define (fixture:aura-body name)
   (cond
@@ -154,7 +155,7 @@
      "(lambda (n) (let rep ((k 0) (r 0)) (if (< k 4) (rep (+ k 1) (let loop ((i 0) (s 0)) (if (< i n) (loop (+ i 1) (+ s (* i i))) s))) r)))")
     (else "")))
 
-; Plans used by the demo and tests. variant: "good" "wrong" "slow" "missing"
+; Plans used by the demo and tests. variant: "generated" "good" "wrong" "slow" "missing"
 ; for hot-sum-sq; cold-add always uses example_add.
 (define (fixture:plan name variant)
   (fixture-counted (fixture-plan-raw name variant)))
@@ -168,8 +169,13 @@
           (counter:wrap (sink-plan:slot p) (fixture:index name) (sink-plan:arity p))
           (sink-plan:fake p))))
 
+; variant "generated": the kernel lib/kgen.aura emitted from the workspace
+; define itself (scripts/gen_kernel.sh -> build/kernels/libgen_<name>.so).
 (define (fixture-plan-raw name variant)
   (cond
+    ((string=? variant "generated")
+     (sink-plan:make name (fixture:so (kgen:base name)) (kgen:symbol name) (fixture-arity name)
+                     (fixture:aura-body name) (fixture-fake name "good")))
     ((string=? name "cold-add")
      (sink-plan:make "cold-add" (fixture:so "example_add") "sink_add" 2
                      (fixture:aura-body "cold-add") (fixture-fake "cold-add" "good")))

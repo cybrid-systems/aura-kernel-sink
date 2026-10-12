@@ -1,0 +1,13 @@
+; scripts/kgen.aura — generate C kernels for the discovered candidates of the
+; fixture workspace into build/gen/ (run via scripts/gen_kernel.sh).
+(require "fixture" all:)
+(require "discover" all:)
+(require "kgen" all:)
+(display "RUN-ONCE") (newline)
+(set-code (fixture:workspace-code))
+(eval-current)
+(define defs (discover:defines (discover:scan)))
+(define (names rows) (if (null? rows) (list) (cons (car (car rows)) (names (cdr rows)))))
+(define rows (kgen:emit! defs (names (discover:candidates defs)) (string-append (fixture:root) "/build/gen")))
+(display "== kgen: discovered candidates -> build/gen/*.c") (newline)
+(kgen:print rows)

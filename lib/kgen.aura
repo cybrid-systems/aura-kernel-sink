@@ -1,0 +1,274 @@
+; lib/kgen.aura — minimal C kernel generator.
+;
+; Input: one discovered workspace define as a tree from discover:read, i.e.
+;   (lambda (p ...) BODY)   atoms are strings, as (query:code) prints them.
+; Output: (list #t c-source) or (list #f reason). Never a guessed kernel: any
+; form outside the subset below is a skip with a reason.
+;
+; Supported subset (Int -> Int, fixnum arithmetic):
+;   expressions  integer literals, parameters / loop variables,
+;                (+ e ...) (- e ...) (* e ...), (if COND e e)
+;   conditions   (< a b) (> a b) (<= a b) (>= a b) (= a b), (and ..) (or ..)
+;                (not c), #t #f
+;   tail forms   (if COND tail tail); a tail call to the define itself or to
+;                a letrec loop -> goto (named let desugars to
+;                (letrec ((L (lambda (v ..) BODY))) (L init ..)));
+;                anything else -> return EXPR
+; Rejected with a reason: string / float / boolean values, other calls
+; (callbacks into Aura are impossible from a kernel), non-tail recursion,
+; division (Aura error semantics on 0), begin / set! / multi-form bodies.
+;
+; Arithmetic is emitted on int64_t and compiled with -fwrapv. The Aura side
+; is fixnum (|x| < 2^62); the golden cases in score keep results inside both.
+
+(export kgen:compile kgen:symbol kgen:base kgen:supported? kgen:emit! kgen:print)
+
+(define (kg-ok v) (list #t v))
+(define (kg-err r) (list #f r))
+(define (kg-ok? r) (car r))
+(define (kg-val r) (car (cdr r)))
+
+(define (kg-strlit? a) (and (string? a) (> (string-length a) 0) (= (string-ref a 0) 34)))
+
+(define (kg-len xs) (if (null? xs) 0 (+ 1 (kg-len (cdr xs)))))
+
+; C identifier for a define name: [A-Za-z0-9] kept, everything else -> _
+(define (kg-c-char s i)
+  (let ((c (string-ref s i)))
+    (if (or (and (>= c 48) (<= c 57)) (and (>= c 65) (<= c 90)) (and (>= c 97) (<= c 122)))
+        (substring s i (+ i 1))
+        "_")))
+(define (kg-sanitize s)
+  (let loop ((i 0) (acc ""))
+    (if (>= i (string-length s)) acc (loop (+ i 1) (string-append acc (kg-c-char s i))))))
+
+(define (kgen:symbol name) (string-append "sink_gen_" (kg-sanitize name)))
+; build/gen/<base>.c -> build/kernels/lib<base>.so
+(define (kgen:base name) (string-append "gen_" (kg-sanitize name)))
+
+(define (kg-int-literal? a)
+  (and (string? a) (not (kg-strlit? a))
+       (let ((n (try (string->number a) (catch (e) #f))))
+         (and (number? n) (integer? n) (not (kg-has-dot? a 0))))))
+(define (kg-has-dot? a i)
+  (cond ((>= i (string-length a)) #f)
+        ((= (string-ref a i) 46) #t)
+        ((= (string-ref a i) 101) #t)   ; exponent: 1e3 reads as a float
+        (else (kg-has-dot? a (+ i 1)))))
+
+; env: list of (aura-name c-name); loops: list of (name depth c-vars)
+(define (kg-lookup x al)
+  (cond ((null? al) #f) ((equal? (car (car al)) x) (car al)) (else (kg-lookup x (cdr al)))))
+
+(define (kg-arith op args env loops)
+  (let loop ((xs args) (acc "") (first #t))
+    (if (null? xs)
+        (kg-ok (string-append "(" acc ")"))
+        (let ((r (kg-expr (car xs) env loops)))
+          (if (kg-ok? r)
+              (loop (cdr xs) (string-append acc (if first "" (string-append " " op " ")) (kg-val r)) #f)
+              r)))))
+
+(define (kg-expr t env loops)
+  (cond
+    ((string? t)
+     (cond ((kg-strlit? t) (kg-err "string literal (not Int)"))
+           ((or (string=? t "#t") (string=? t "#f")) (kg-err "boolean value (not Int)"))
+           ((kg-int-literal? t) (kg-ok (string-append "INT64_C(" t ")")))
+           ((kg-lookup t env) (kg-ok (car (cdr (kg-lookup t env)))))
+           ((and (string->number t) #t) (kg-err (string-append "non-integer literal " t)))
+           (else (kg-err (string-append "free variable " t)))))
+    ((null? t) (kg-err "empty form"))
+    ((not (string? (car t))) (kg-err "computed operator"))
+    (else
+     (let ((h (car t)) (args (cdr t)))
+       (cond
+         ((and (string=? h "+") (null? args)) (kg-ok "INT64_C(0)"))
+         ((and (string=? h "*") (null? args)) (kg-ok "INT64_C(1)"))
+         ((string=? h "+") (kg-arith "+" args env loops))
+         ((string=? h "*") (kg-arith "*" args env loops))
+         ((and (string=? h "-") (= (kg-len args) 1))
+          (let ((r (kg-expr (car args) env loops)))
+            (if (kg-ok? r) (kg-ok (string-append "(-" (kg-val r) ")")) r)))
+         ((and (string=? h "-") (> (kg-len args) 1)) (kg-arith "-" args env loops))
+         ((and (string=? h "if") (= (kg-len args) 3))
+          (let ((c (kg-cond (car args) env loops))
+                (a (kg-expr (car (cdr args)) env loops))
+                (b (kg-expr (car (cdr (cdr args))) env loops)))
+            (cond ((not (kg-ok? c)) c) ((not (kg-ok? a)) a) ((not (kg-ok? b)) b)
+                  (else (kg-ok (string-append "(" (kg-val c) " ? " (kg-val a) " : " (kg-val b) ")"))))))
+         ((kg-lookup h loops) (kg-err (string-append "non-tail recursive call to " h)))
+         ((or (string=? h "quotient") (string=? h "remainder") (string=? h "modulo") (string=? h "/"))
+          (kg-err (string-append "division " h " (Aura error on 0) unsupported")))
+         (else (kg-err (string-append "unsupported call " h))))))))
+
+(define (kg-cmp? h) (or (string=? h "<") (string=? h ">") (string=? h "<=") (string=? h ">=") (string=? h "=")))
+
+(define (kg-logic op args env loops)
+  (let loop ((xs args) (acc "") (first #t))
+    (if (null? xs)
+        (kg-ok (if first (if (string=? op "&&") "1" "0") (string-append "(" acc ")")))
+        (let ((r (kg-cond (car xs) env loops)))
+          (if (kg-ok? r)
+              (loop (cdr xs) (string-append acc (if first "" (string-append " " op " ")) (kg-val r)) #f)
+              r)))))
+
+(define (kg-cond t env loops)
+  (cond
+    ((and (string? t) (string=? t "#t")) (kg-ok "1"))
+    ((and (string? t) (string=? t "#f")) (kg-ok "0"))
+    ((or (string? t) (null? t) (not (string? (car t))))
+     (kg-err "condition is not a comparison (Aura truthiness of Int differs from C)"))
+    ((and (kg-cmp? (car t)) (= (kg-len (cdr t)) 2))
+     (let ((a (kg-expr (car (cdr t)) env loops)) (b (kg-expr (car (cdr (cdr t))) env loops)))
+       (cond ((not (kg-ok? a)) a) ((not (kg-ok? b)) b)
+             (else (kg-ok (string-append "(" (kg-val a) " " (if (string=? (car t) "=") "==" (car t)) " " (kg-val b) ")"))))))
+    ((string=? (car t) "and") (kg-logic "&&" (cdr t) env loops))
+    ((string=? (car t) "or") (kg-logic "||" (cdr t) env loops))
+    ((and (string=? (car t) "not") (= (kg-len (cdr t)) 1))
+     (let ((r (kg-cond (car (cdr t)) env loops))) (if (kg-ok? r) (kg-ok (string-append "(!" (kg-val r) ")")) r)))
+    (else (kg-err (string-append "unsupported condition " (car t))))))
+
+; c-vars for loop depth d: l<d>_0 ...
+(define (kg-vars d n)
+  (let loop ((k (- n 1)) (acc (list)))
+    (if (< k 0) acc
+        (loop (- k 1) (cons (string-append "l" (number->string d) "_" (number->string k)) acc)))))
+
+(define (kg-bind names cvars env)
+  (if (null? names) env (kg-bind (cdr names) (cdr cvars) (cons (list (car names) (car cvars)) env))))
+
+(define (kg-all-strings? xs) (cond ((null? xs) #t) ((and (string? (car xs)) (not (kg-strlit? (car xs)))) (kg-all-strings? (cdr xs))) (else #f)))
+
+; Tail call to a loop: evaluate all args into temps, assign, goto.
+(define (kg-jump loop args env loops ind)
+  (let ((d (number->string (car (cdr loop)))) (cvars (car (cdr (cdr loop)))))
+    (if (not (= (kg-len args) (kg-len cvars)))
+        (kg-err (string-append "arity mismatch in call to " (car loop)))
+        (let walk ((xs args) (vs cvars) (k 0) (decl "") (asg ""))
+          (if (null? xs)
+              (kg-ok (string-append ind "{\n" decl asg ind "  goto top_" d ";\n" ind "}\n"))
+              (let ((r (kg-expr (car xs) env loops)) (tmp (string-append "t" d "_" (number->string k))))
+                (if (kg-ok? r)
+                    (walk (cdr xs) (cdr vs) (+ k 1)
+                          (string-append decl ind "  int64_t " tmp " = " (kg-val r) ";\n")
+                          (string-append asg ind "  " (car vs) " = " tmp ";\n"))
+                    r)))))))
+
+; (letrec ((L (lambda (v ..) BODY))) (L init ..))
+(define (kg-letrec-loop? t)
+  (and (pair? t) (= (kg-len t) 3) (equal? (car t) "letrec")
+       (pair? (car (cdr t))) (= (kg-len (car (cdr t))) 1)
+       (let ((b (car (car (cdr t)))))
+         (and (pair? b) (= (kg-len b) 2) (string? (car b))
+              (let ((lam (car (cdr b))))
+                (and (pair? lam) (= (kg-len lam) 3) (equal? (car lam) "lambda")
+                     (pair? (car (cdr lam))) (kg-all-strings? (car (cdr lam)))))
+              (let ((call (car (cdr (cdr t)))))
+                (and (pair? call) (equal? (car call) (car b))))))))
+
+(define (kg-loop t env loops ind)
+  (let* ((b (car (car (cdr t))))
+         (name (car b))
+         (lam (car (cdr b)))
+         (params (car (cdr lam)))
+         (body (car (cdr (cdr lam))))
+         (inits (cdr (car (cdr (cdr t)))))
+         (d (+ 1 (kg-len loops)))
+         (cvars (kg-vars d (kg-len params))))
+    (if (not (= (kg-len inits) (kg-len params)))
+        (kg-err (string-append "arity mismatch in loop " name))
+        (let walk ((xs inits) (vs cvars) (decl ""))
+          (if (null? xs)
+              (let ((r (kg-stmt body (kg-bind params cvars env)
+                                (cons (list name d cvars) loops) (string-append ind "  "))))
+                (if (kg-ok? r)
+                    (kg-ok (string-append ind "{\n" decl ind "top_" (number->string d) ": ;\n" (kg-val r) ind "}\n"))
+                    r))
+              (let ((r (kg-expr (car xs) env loops)))
+                (if (kg-ok? r)
+                    (walk (cdr xs) (cdr vs) (string-append decl ind "  int64_t " (car vs) " = " (kg-val r) ";\n"))
+                    r)))))))
+
+(define (kg-stmt t env loops ind)
+  (cond
+    ((and (pair? t) (equal? (car t) "if") (= (kg-len t) 4))
+     (let ((c (kg-cond (car (cdr t)) env loops))
+           (a (kg-stmt (car (cdr (cdr t))) env loops (string-append ind "  ")))
+           (b (kg-stmt (car (cdr (cdr (cdr t)))) env loops (string-append ind "  "))))
+       (cond ((not (kg-ok? c)) c) ((not (kg-ok? a)) a) ((not (kg-ok? b)) b)
+             (else (kg-ok (string-append ind "if " (kg-val c) " {\n" (kg-val a) ind "} else {\n" (kg-val b) ind "}\n"))))))
+    ((kg-letrec-loop? t) (kg-loop t env loops ind))
+    ((and (pair? t) (string? (car t)) (kg-lookup (car t) loops))
+     (kg-jump (kg-lookup (car t) loops) (cdr t) env loops ind))
+    ((and (pair? t) (member-of? (car t) (list "begin" "set!" "let" "let*" "letrec" "define" "lambda")))
+     (kg-err (string-append "unsupported form " (car t))))
+    (else
+     (let ((r (kg-expr t env loops)))
+       (if (kg-ok? r) (kg-ok (string-append ind "return " (kg-val r) ";\n")) r)))))
+
+(define (member-of? x xs) (cond ((null? xs) #f) ((equal? x (car xs)) #t) (else (member-of? x (cdr xs)))))
+
+(define (kg-params s n)
+  (let loop ((k 0) (acc ""))
+    (if (>= k n) acc
+        (loop (+ k 1) (string-append acc (if (= k 0) "" ", ") s (number->string k))))))
+
+; name: define name; tree: (lambda (p ..) BODY). Returns (#t c-source) | (#f reason).
+(define (kgen:compile name tree)
+  (cond
+    ((not (and (pair? tree) (equal? (car tree) "lambda"))) (kg-err "not a lambda"))
+    ((not (= (kg-len tree) 3)) (kg-err "body is not a single form"))
+    ((not (and (pair? (car (cdr tree))) (kg-all-strings? (car (cdr tree)))))
+     (kg-err "variadic or zero-arity lambda"))
+    ((> (kg-len (car (cdr tree))) 4) (kg-err "more than 4 parameters"))
+    (else
+     (let* ((params (car (cdr tree)))
+            (n (kg-len params))
+            (cvars (kg-vars 0 n))
+            (r (kg-stmt (car (cdr (cdr tree))) (kg-bind params cvars (list))
+                        (list (list name 0 cvars)) "  ")))
+       (if (not (kg-ok? r))
+           r
+           (kg-ok
+            (string-append
+             "/* GENERATED by lib/kgen.aura from the workspace define `" name "`. Do not edit. */\n"
+             "#include <stdint.h>\n#include \"sink_abi.h\"\nAURA_SINK_MODULE\n\n"
+             "AURA_SINK_EXPORT long " (kgen:symbol name) "(" (kg-params "long a" n) ") {\n"
+             (kg-decl0 cvars 0)
+             "top_0: ;\n"
+             (kg-val r)
+             "}\n")))))))
+
+(define (kg-decl0 cvars k)
+  (if (null? cvars) ""
+      (string-append "  int64_t " (car cvars) " = a" (number->string k) ";\n" (kg-decl0 (cdr cvars) (+ k 1)))))
+
+(define (kgen:supported? name tree) (kg-ok? (kgen:compile name tree)))
+
+; Generate one C file per name in names (trees looked up in defs, the
+; discover:defines output) into dir/<base>.c. Returns rows
+;   (name "generated" path) | (name "skipped" reason)
+(define (kgen:emit! defs names dir)
+  (let loop ((ns names) (acc (list)))
+    (if (null? ns)
+        (kg-rev acc)
+        (let* ((name (car ns)) (d (kg-lookup name defs)))
+          (if (not d)
+              (loop (cdr ns) (cons (list name "skipped" "no such define") acc))
+              (let ((r (kgen:compile name (car (cdr d)))))
+                (if (kg-ok? r)
+                    (let ((path (string-append dir "/" (kgen:base name) ".c")))
+                      (if (equal? (try (write-file path (kg-val r)) (catch (e) #f)) #f)
+                          (loop (cdr ns) (cons (list name "skipped" (string-append "cannot write " path)) acc))
+                          (loop (cdr ns) (cons (list name "generated" path) acc))))
+                    (loop (cdr ns) (cons (list name "skipped" (kg-val r)) acc)))))))))
+
+(define (kg-rev xs) (let loop ((xs xs) (acc (list))) (if (null? xs) acc (loop (cdr xs) (cons (car xs) acc)))))
+
+(define (kgen:print rows)
+  (if (null? rows) #t
+      (let ((r (car rows)))
+        (display "  ") (display (car (cdr r))) (display " ") (display (car r))
+        (display ": ") (display (car (cdr (cdr r)))) (newline)
+        (kgen:print (cdr rows)))))

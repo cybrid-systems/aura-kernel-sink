@@ -63,11 +63,15 @@
 (define r-missing #f)
 (define r-add #f)
 (define r-good #f)
+(define r-gen #f)
 (set! r-wrong (attempt "hot-sum-sq" "wrong"))
 (set! r-slow (attempt "hot-sum-sq" "slow"))
 (set! r-missing (if (string=? plant-kind "real") (attempt "hot-sum-sq" "missing") #f))
 (set! r-add (attempt "cold-add" "good"))
-(set! r-good (attempt "hot-sum-sq" "good"))
+;; Generated kernel first (lib/kgen.aura); the hand-written one is the fallback.
+(set! r-gen (attempt "hot-sum-sq" "generated"))
+(set! r-good (if (loop:accepted? r-gen) r-gen (attempt "hot-sum-sq" "good")))
+(display "  sunk with: ") (display (if (loop:accepted? r-gen) "generated kernel" "hand-written fallback")) (newline)
 
 (display "-- 4. final state") (newline)
 (display "  (hot-sum-sq 100) = ") (display (hot-sum-sq 100)) (newline)
@@ -83,5 +87,6 @@
 (expect "missing .so rejected before any mutation" (or (not r-missing) (string=? (loop:stage r-missing) "load")))
 (expect "trivial add kernel rejected (not faster)" (and (not (loop:accepted? r-add)) (loop:rollback-ok? r-add)))
 (expect "good kernel accepted" (loop:accepted? r-good))
+(expect "generated kernel accepted (no hand-written fallback needed)" (loop:accepted? r-gen))
 (expect "sunk hot-sum-sq still correct" (= (hot-sum-sq 100) 328350))
 (expect-summary)

@@ -6,7 +6,7 @@
 set -uo pipefail
 source "$(dirname "$0")/env.sh"
 cd "$REPO_ROOT"
-"$REPO_ROOT/kernels/build.sh" || exit 1
+"$REPO_ROOT/scripts/gen_kernel.sh" || exit 1
 status=0
 files=("$@")
 [ ${#files[@]} -eq 0 ] && files=("$REPO_ROOT"/tests/*.aura)
