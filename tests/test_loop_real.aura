@@ -14,6 +14,7 @@
 
 (set-code (fixture:workspace-code))
 (eval-current)
+(expect "real: candidates instrumented with live call counters" (fixture:instrument!))
 (define aura-100 (hot-sum-sq 100))
 (expect "real: seed workspace, (hot-sum-sq 100) = 328350" (= aura-100 328350))
 
@@ -28,6 +29,7 @@
 (expect "real wrong: rolled back and golden re-checked" (and (loop:rolled-back? r) (loop:rollback-ok? r)))
 (expect "real wrong: kernel slot restored to 0" (equal? sink-kernel-hot-sum-sq 0))
 (expect "real wrong: Aura body answers again" (= (hot-sum-sq 100) 328350))
+(expect "real wrong: restored body is still counted" (= ((fixture:observe "hot" 5) "hot-sum-sq") 5))
 
 (set! r (harness:attempt plant "hot-sum-sq" "slow" (sink-min-speedup)))
 (expect "real slow: rejected" (not (loop:accepted? r)))
@@ -52,6 +54,7 @@
 (expect "real good: not rolled back" (not (loop:rolled-back? r)))
 (expect "real good: kernel slot holds a procedure" (procedure? sink-kernel-hot-sum-sq))
 (expect "real good: sunk hot-sum-sq is correct" (= (hot-sum-sq 100) 328350))
+(expect "real good: sunk wrapper keeps counting live calls" (= ((fixture:observe "hot" 7) "hot-sum-sq") 7))
 (expect "real good: sunk version is the new last-good" (string=? (hot-strategy:active-name) "hot-sum-sq"))
 
 ; A bad attempt after the accept must heal back to the sunk version, not to

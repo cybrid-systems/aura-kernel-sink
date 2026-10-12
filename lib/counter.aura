@@ -1,0 +1,72 @@
+; lib/counter.aura — live per-define call counters (interim, Aura-side).
+;
+; The pinned Aura tip has no per-define runtime call counter (no query:* /
+; engine:metrics key reports invocations per define; query:calls is static
+; call sites). Until it does, the sink counts calls itself:
+;
+;   * the workspace holds `sink-calls`, a vector with one slot per candidate
+;     (counter:workspace-code);
+;   * counter:instrument! hot-swaps a candidate with mutate:rebind into a thin
+;     counting wrapper that bumps slot i inline and calls the original:
+;     (lambda (a0 ..) (vector-set! sink-calls i (+ 1 (vector-ref sink-calls i)))
+;                     (<original> a0 ..))
+;     The bump is inlined rather than a sink-tick! helper define because a
+;     workspace with 9+ procedure defines runs ~35x slower on the pinned tip
+;     (aura#4479), and every helper counts.
+;   * the sink wrapper is counted the same way (counter:wrap), so a sunk
+;     define keeps reporting calls and rollback restores a counted body.
+;
+; The counters live in the workspace, not in the host file: a workspace body
+; that names a host-file define fails the mutate:rebind typecheck
+; ("unbound variable"). Consequence: eval-current re-evaluates
+; (define sink-calls ...) and zeroes every counter, so counts are a window
+; that starts at the last eval-current (or counter:reset!). identify reads the
+; window with counter:observe: reset, run the live workload, read.
+
+(export counter:workspace-code
+        counter:wrap
+        counter:instrument!
+        counter:reset!
+        counter:count
+        counter:observe)
+
+(define (counter-args arity)
+  (let loop ((i 0) (acc ""))
+    (if (< i arity)
+        (loop (+ i 1) (string-append acc (if (= i 0) "" " ") "a" (number->string i)))
+        acc)))
+
+; Workspace defines for n counter slots.
+(define (counter:workspace-code n)
+  (string-append
+   "(define sink-calls (make-vector " (number->string n) " 0))\n"))
+
+; Counting wrapper around `body` (a define name, or a lambda source string;
+; prefer a name: an inline lambda allocates a closure on every call).
+(define (counter:wrap body index arity)
+  (let ((args (counter-args arity)))
+    (string-append "(lambda (" args ") (vector-set! sink-calls " (number->string index)
+                   " (+ 1 (vector-ref sink-calls " (number->string index) "))) ("
+                   body (if (= arity 0) "" " ") args "))")))
+
+; Hot-swap define `name` into its counting wrapper. Returns #t or the
+; mutate:rebind failure value. Caller runs eval-current (which zeroes counters).
+(define (counter:instrument! name index arity body)
+  (mutate:rebind name (counter:wrap body index arity) "aura-kernel-sink:count"))
+
+(define (counter:reset!)
+  (let loop ((i 0))
+    (if (< i (vector-length sink-calls))
+        (begin (vector-set! sink-calls i 0) (loop (+ i 1)))
+        #t)))
+
+(define (counter-nth l k) (if (= k 0) (car l) (counter-nth (cdr l) (- k 1))))
+(define (counter:count index) (vector-ref sink-calls index))
+
+; Reset, run (thunk) — the live workload — and return a procedure
+; index -> calls observed during that run.
+(define (counter:observe thunk)
+  (counter:reset!)
+  (thunk)
+  (let ((snap (vector->list sink-calls)))
+    (lambda (index) (counter-nth snap index))))

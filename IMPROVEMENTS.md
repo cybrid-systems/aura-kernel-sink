@@ -15,10 +15,15 @@ Each has a minimal repro in `probes/`.
 
 ## Aura API gaps (not filed as bugs)
 
-1. **No per-define runtime call counter.** `query:calls` gives static call
-   sites only. `identify.aura` uses a hard-coded `observed-calls` column. A
-   `query:define-call-stats` (calls, total ns per define, sampled) would let the
-   loop find hotspots by itself.
+1. **No per-define runtime call counter.** No `query:*` / `engine:metrics` key
+   on `94ca96362` reports invocations per define; `query:calls` is static call
+   sites. Interim: `lib/counter.aura` hot-swaps candidates into counting
+   wrappers with `mutate:rebind` and keeps counts in a workspace vector
+   (`sink-calls`). Costs: one extra call + a vector bump per invocation, only
+   candidates are counted, counts reset on every `eval-current`, and the
+   wrappers use workspace procedure slots (see #4479). A native
+   `query:define-call-stats` (calls, total ns per define, sampled) would replace
+   all of that and cover functions nobody thought to instrument.
 2. **`c-load` returns `0` on failure, and `0` is also the first handle.** Aura
    treats `0` as false, so `(if lib ...)` rejects the first good handle, and a
    failed `c-load` followed by `c-func 0 ...` can bind a symbol from a different
@@ -55,11 +60,13 @@ Each has a minimal repro in `probes/`.
 | results stored with `set!`, not `(define x (attempt ...))` | `scripts/mvp.aura`, `tests/test_loop_*.aura` | #4476 |
 | test helper named `expect`, not `check` | `lib/expect.aura` | #4477 |
 | `RUN-ONCE` marker checked by `run_tests.sh` | `scripts/run_tests.sh` | #4476, #4478 |
+| counter bump inlined in each wrapper (no `sink-tick!` helper), no `driver` define, one `app-workload` with a `hot?` flag: workspace kept at 8 procedure defines | `lib/counter.aura`, `lib/fixture.aura` | #4479 |
+| counting wrapper calls a named `sink-impl-<name>`, not an inline `((lambda ...) a0)` (closure per call skews the baseline) | `lib/fixture.aura` | — |
 | `c-func` probed with `procedure?` before rebinding; handle boxed | `lib/plant.aura` | API gaps 2–3 |
 
 ## Next steps
 
-1. Runtime call profile instead of the fixture column (needs gap 1).
+1. ~~Runtime call profile instead of the fixture column~~ done (interim wrappers, `lib/counter.aura`); switch to a native per-define counter when Aura has one (gap 1). Also: auto-discover candidates (every numeric define) instead of the fixed three, and keep a rolling window across `eval-current`.
 2. Kernel generator: emit `kernels/<name>.c` from the define's AST for the
    numeric-loop subset, then build + sink without hand-written C.
 3. Float ABI kernels (`(Float Float) -> Float`), vector/opaque buffers through

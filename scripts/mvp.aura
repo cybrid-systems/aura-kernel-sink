@@ -6,6 +6,7 @@
 (require "plant" all:)
 (require "score" all:)
 (require "loop" all:)
+(require "counter" all:)
 (require "harness" all:)
 (require "std/hot-strategy" all:)
 (display "RUN-ONCE") (newline)  ; run_tests.sh fails if this prints twice (silent file re-run)
@@ -18,11 +19,17 @@
 ; 0. Seed the workspace: candidates, kernel slots, control-plane policy.
 (set-code (fixture:workspace-code))
 (eval-current)
+(display "-- 0b. instrument candidates (mutate:rebind -> counting wrappers), run live workload") (newline)
+(define instrumented (fixture:instrument!))
+(define live (fixture:observe "hot" 400))
+(display "  live calls: hot-sum-sq=") (display (live "hot-sum-sq"))
+(display " cold-add=") (display (live "cold-add"))
+(display " label-of=") (display (live "label-of")) (newline)
 
 ; 1. Identify. The policy is the workspace define sink-policy.
 (define policy (lambda (calls ms numeric) (sink-policy calls ms numeric)))
 (display "-- 1. identify (policy = workspace sink-policy)") (newline)
-(define records (identify:run (fixture:candidates) fixture:probe policy))
+(define records (identify:run (fixture:candidates) fixture:probe policy live))
 (identify:print records)
 (define selected (identify:selected records))
 (display "  selected: ") (display selected) (newline)
@@ -31,7 +38,7 @@
 (display "-- 1b. hot-swap sink-policy (budget 50 ms -> 1e9 ms), re-identify, restore") (newline)
 (mutate:rebind "sink-policy" (fixture:policy-body 1000000000 50) "raise budget")
 (eval-current)
-(display "  selected: ") (display (identify:selected (identify:run (fixture:candidates) fixture:probe policy))) (newline)
+(display "  selected: ") (display (identify:selected (identify:run (fixture:candidates) fixture:probe policy live))) (newline)
 (mutate:rebind "sink-policy" (fixture:policy-body 50 50) "restore budget")
 (eval-current)
 
@@ -64,6 +71,7 @@
 (display ", active = ") (display (hot-strategy:active-name)) (newline)
 (display "  query:aot-reload-primitive-stats = ") (display (engine:metrics "query:aot-reload-primitive-stats")) (newline)
 
+(expect "candidates instrumented, live counter saw 400 hot-sum-sq calls" (and instrumented (= (live "hot-sum-sq") 400)))
 (expect "identify selects hot-sum-sq only" (equal? selected (list "hot-sum-sq")))
 (expect "wrong kernel rejected and healed" (and (not (loop:accepted? r-wrong)) (loop:rollback-ok? r-wrong)))
 (expect "slow kernel rejected and healed" (and (not (loop:accepted? r-slow)) (loop:rollback-ok? r-slow)))

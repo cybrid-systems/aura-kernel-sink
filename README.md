@@ -17,7 +17,7 @@ MVP，钉在 Aura `c4fc6cf23`（RelWithDebInfo，Soft 面：`AURA_SANDBOX=off AU
 ### 闭环
 
 ```
-identify.aura    热点识别：observed-calls（fixture 画像）× 实测 ms/call + query:calls 调用点
+identify.aura    热点识别：observed-calls（实时按 define 调用计数，lib/counter.aura）× 实测 ms/call + query:calls 调用点
                  决策交给 workspace 里的 sink-policy（可热更新）
       ↓
 sink_plan.aura   计划：slot sink-kernel-<name>、.so、符号、c-func 签名、封装体
@@ -42,41 +42,48 @@ score.aura       正确性（golden，异常算错）+ 确定性 + 加速比 ≥
 export AURA_BIN=~/aura/build-rel/aura      # Aura 构建（AURA_LIB 默认 <checkout>/lib）
 scripts/run_mvp.sh                         # 端到端：真 .so（RealPlant）
 SINK_PLANT=fake scripts/run_mvp.sh         # 同一闭环，Aura 替身数据面
-scripts/run_tests.sh                       # 4 个测试文件，95 项检查
+scripts/run_tests.sh                       # 4 个测试文件，112 项检查
 ```
 
-`run_mvp.sh` 在 `c4fc6cf23` 上的一次输出（节选；计时每次略有浮动）：
+`run_mvp.sh` 在 `94ca96362` 上的一次输出（节选；计时每次略有浮动）：
 
 ```
+-- 0b. instrument candidates (mutate:rebind -> counting wrappers), run live workload
+  live calls: hot-sum-sq=400 cold-add=4800 label-of=400
 -- 1. identify (policy = workspace sink-policy)
-  hot-sum-sq  sink=#t  score=515.333  calls=400  sites=2  ms/call=1.28333  numeric=#t
-  cold-add  sink=#f  score=61  calls=5000  sites=1  ms/call=0.012  numeric=#t
-  label-of  sink=#f  score=3.6  calls=300  sites=0  ms/call=0.012  numeric=#f
+  hot-sum-sq  sink=#t  score=374.333  calls=400  sites=1  ms/call=0.933333  numeric=#t
+  cold-add  sink=#f  score=51.4  calls=4800  sites=1  ms/call=0.0105  numeric=#t
+  label-of  sink=#f  score=5.2  calls=400  sites=1  ms/call=0.0105  numeric=#f
   selected: (hot-sum-sq)
 -- 1b. hot-swap sink-policy (budget 50 ms -> 1e9 ms), re-identify, restore
   selected: ()
--- attempt hot-sum-sq / wrong      (libbad_wrong.so)
-  [real] hot-sum-sq: reject reasons=(wrong-result) speedup=0 t-before=75ms t-after=0ms stage=score rolled-back=#t rollback-ok=#t
--- attempt hot-sum-sq / slow       (libbad_slow.so)
-  [real] hot-sum-sq: reject reasons=(too-slow) speedup=0.388889 t-before=77ms t-after=198ms stage=score rolled-back=#t rollback-ok=#t
--- attempt hot-sum-sq / missing    (no .so: nothing mutated)
-  [real] hot-sum-sq: reject reasons=(load-failed) speedup=0 t-before=79ms t-after=0ms stage=load rolled-back=#f rollback-ok=#t
--- attempt cold-add / good         (libexample_add.so: FFI call costs as much as the body)
-  [real] cold-add: reject reasons=(too-slow) speedup=0.609756 t-before=25ms t-after=41ms stage=score rolled-back=#t rollback-ok=#t
--- attempt hot-sum-sq / good       (libsum_sq.so)
-  [real] hot-sum-sq: accept reasons=() speedup=38.5 t-before=77ms t-after=2ms stage=score rolled-back=#f rollback-ok=#t
+  [real] hot-sum-sq: reject reasons=(wrong-result) speedup=0 t-before=58ms t-after=0ms stage=score rolled-back=#t rollback-ok=#t
+  [real] hot-sum-sq: reject reasons=(too-slow) speedup=0.170213 t-before=56ms t-after=329ms stage=score rolled-back=#t rollback-ok=#t
+  [real] hot-sum-sq: reject reasons=(load-failed) speedup=0 t-before=67ms t-after=0ms stage=load rolled-back=#f rollback-ok=#t
+  [real] cold-add: reject reasons=(too-slow) speedup=0.511111 t-before=23ms t-after=45ms stage=score rolled-back=#t rollback-ok=#t
+  [real] hot-sum-sq: accept reasons=() speedup=29.5 t-before=59ms t-after=2ms stage=score rolled-back=#f rollback-ok=#t
 -- 4. final state
   (hot-sum-sq 100) = 328350
   hot-strategy version = 6, active = hot-sum-sq
-checks: 7 passed, 0 failed
+checks: 8 passed, 0 failed
 ```
+
+### 实时调用计数（`lib/counter.aura`，过渡实现）
+
+- `fixture:instrument!` 用 `mutate:rebind` 把每个候选换成计数包装：
+  `(lambda (a0) (vector-set! sink-calls 0 (+ 1 (vector-ref sink-calls 0))) (sink-impl-hot-sum-sq a0))`，原函数体留在 `sink-impl-<name>`。
+- `counter:observe`：清零 → 跑真实负载（`app-workload`）→ 读计数，交给 `identify:run` 的 `calls-of`。不再有写死的 calls 列。
+- 换个负载（`app-workload` 的 `hot?=#f`，从不调 `hot-sum-sq`）同一份代码就不选它：决策由实时计数驱动。
+- 下沉后的包装也计数；`hot-strategy:heal!` 回滚恢复的是计数版函数体，计数不断。
+- 限制：计数器在 workspace 里，`eval-current` 会重新求值 `(define sink-calls ...)` 并清零，所以计数是从上次 `eval-current` 开始的窗口；包装引用的是 workspace 名字（引用宿主文件的 define 会让 `mutate:rebind` 类型检查报 unbound）。这不是 VM 级计数器，Aura 提供按 define 的原生计数后应替换。
+- workspace 要保持 ≤8 个过程 define：第 9 个会让无关函数调用慢约 35 倍（aura#4479），这会让基线变慢、把本该拒绝的 kernel 判成更快。所以计数是内联在包装里，没有单独的 `sink-tick!`。
 
 ### 什么是真的，什么是替身
 
 | 步骤 | 状态 |
 |---|---|
 | 识别：实测 ms/call、`query:calls` 调用点、workspace 策略决策、策略热替换 | **真跑** |
-| 调用次数画像 | **fixture**（Aura 还没有按 define 的运行时调用计数，见 IMPROVEMENTS） |
+| 调用次数画像 | **真跑（过渡实现）**：`mutate:rebind` 把候选换成计数包装，计数器在 workspace 的 `sink-calls` 向量里；Aura 还没有原生按 define 的调用计数，见 IMPROVEMENTS |
 | 生成 C kernel | **手写**（`kernels/*.c`；生成器是后续项） |
 | 编译 `.so` | **真跑**（`kernels/build.sh`，`cc -O2 -shared -fPIC`） |
 | `aot:reload` 加载 | **真跑**，Soft 面返回 `#t`、走 staging + epoch bump；但 kernel 不是 Aura AOT 模块，调用路径走 `c-func` |
@@ -119,16 +126,17 @@ MVP, pinned to Aura `c4fc6cf23` (RelWithDebInfo, Soft face:
 
 | path | role |
 |---|---|
-| `lib/identify.aura` | hotspot signals (observed calls × measured ms/call, `query:calls` sites); decision delegated to the workspace `sink-policy` |
+| `lib/identify.aura` | hotspot signals (live call counts × measured ms/call, `query:calls` sites); decision delegated to the workspace `sink-policy` |
+| `lib/counter.aura` | live per-define call counters: counting wrappers via `mutate:rebind`, `counter:observe` = reset → run workload → read |
 | `lib/sink_plan.aura` | plan: kernel slot, `.so`, symbol, `c-func` signature, wrapper body, documented primitive sequence |
 | `lib/plant.aura` | RealPlant (`aot:reload` + `c-load` + `c-func` probe) and FakePlant (Aura stand-in bodies) |
 | `lib/score.aura` | correctness (golden; errors count as wrong), determinism, speedup ≥ min |
 | `lib/loop.aura` | one attempt: register! → load → rebind slot + wrapper → eval-current → score → accept / heal! + golden re-check |
-| `lib/fixture.aura` | toy workload: `hot-sum-sq` (hot loop), `cold-add` (trivial), `label-of` (strings) + policy |
+| `lib/fixture.aura` | toy workspace: `hot-sum-sq` (hot loop), `cold-add` (trivial), `label-of` (strings), policy, counters, `app-workload` (the live traffic) |
 | `lib/harness.aura`, `lib/expect.aura` | shared attempt runner, PASS/FAIL helper |
 | `kernels/` | `sum_sq.c` (good), `example_add.c` (trivial), `bad_wrong.c`, `bad_slow.c`, `build.sh` |
 | `scripts/` | `env.sh`, `run_mvp.sh`, `run_tests.sh`, `mvp.aura` |
-| `tests/` | `test_identify`, `test_score`, `test_loop_real`, `test_loop_fake` (95 checks) |
+| `tests/` | `test_identify`, `test_score`, `test_loop_real`, `test_loop_fake` (112 checks) |
 | `probes/` | minimal repros of the Aura bugs found while building this |
 
 ### Run
@@ -150,7 +158,7 @@ mutation).
 | step | status |
 |---|---|
 | identify: measured ms/call, `query:calls` call sites, workspace-policy decision, policy hot-swap | **real** |
-| per-function call counts | **fixture** (Aura has no per-define runtime call counter yet) |
+| per-function call counts | **real, interim**: candidates hot-swapped (`mutate:rebind`) into counting wrappers; counts live in the workspace vector `sink-calls`, read after a workload run (`lib/counter.aura`). Not a VM counter: Aura has none per define yet |
 | C kernel generation | **hand-written** (`kernels/*.c`; generator is future work) |
 | build `.so` | **real** (`kernels/build.sh`) |
 | `aot:reload` | **real**; returns `#t` on Soft with staging + epoch bump. The kernel is not an Aura AOT module, so calls go through `c-func` |

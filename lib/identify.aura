@@ -1,7 +1,8 @@
 ; lib/identify.aura — step 1 of the closed loop: is a function worth sinking?
 ;
 ; Signals (all gathered from inside Aura, no external profiler):
-;   observed-calls  call count from a profile (fixture for now)
+;   observed-calls  LIVE call count: (calls-of name), read from the per-define
+;                   counters of lib/counter.aura after a workload run
 ;   ms-per-call     measured with current-time-ms around a probe
 ;   static-calls    number of call sites, (length (query:calls name))
 ;   numeric?        whether the c-func Int ABI can carry the signature
@@ -50,13 +51,14 @@
 (define (identify:ms-per-call r) (car (cdr (cdr (cdr (cdr (cdr r)))))))
 (define (identify:numeric? r) (car (cdr (cdr (cdr (cdr (cdr (cdr r))))))))
 
-; row: (name arity numeric? observed-calls bench-arg bench-reps)
+; row: (name arity numeric? counter-index bench-arg bench-reps)
+; calls-of: name -> live call count (e.g. fixture:observe).
 ; Score = estimated milliseconds spent in the function (observed * ms/call)
 ; plus one per static call site. The score only ranks; policy decides.
-(define (identify:candidate row probe policy)
+(define (identify:candidate row probe policy calls-of)
   (let ((name (car row))
         (numeric? (car (cdr (cdr row))))
-        (observed (car (cdr (cdr (cdr row)))))
+        (observed (calls-of name))
         (arg (car (cdr (cdr (cdr (cdr row))))))
         (reps (car (cdr (cdr (cdr (cdr (cdr row))))))))
     (let ((ms (identify:measure probe arg reps))
@@ -71,14 +73,15 @@
     ((>= (identify:score r) (identify:score (car sorted))) (cons r sorted))
     (else (cons (car sorted) (identify-insert r (cdr sorted))))))
 
-; rows: fixture rows; probe-of: name -> unary probe; policy: see above.
+; rows: fixture rows; probe-of: name -> unary probe; policy: see above;
+; calls-of: name -> live call count.
 ; Returns records sorted by score, highest first.
-(define (identify:run rows probe-of policy)
+(define (identify:run rows probe-of policy calls-of)
   (let loop ((rs rows) (acc (list)))
     (if (null? rs)
         acc
         (loop (cdr rs)
-              (identify-insert (identify:candidate (car rs) (probe-of (car (car rs))) policy)
+              (identify-insert (identify:candidate (car rs) (probe-of (car (car rs))) policy calls-of)
                                acc)))))
 
 ; Names the policy selected, in score order.
