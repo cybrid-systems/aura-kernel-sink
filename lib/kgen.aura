@@ -24,8 +24,18 @@
 ; (callbacks into Aura are impossible from a kernel), non-tail recursion,
 ; division (Aura error semantics on 0), begin / set! / multi-form bodies.
 ;
-; Arithmetic is emitted on int64_t and compiled with -fwrapv. The Aura side
-; is fixnum (|x| < 2^62); the golden cases in score keep results inside both.
+; Int arithmetic is overflow-checked against the Aura fixnum range
+; [-2^62, 2^62-1]: every + - * (and unary -) goes through sink_ck_add / sink_ck_sub /
+; sink_ck_mul / sink_ck_neg from kernels/sink_abi.h (__builtin_*_overflow + range
+; check), which set the kernel-local flag `ovf`. Every return and every loop
+; jump tests the flag (a return also refuses results <= -5*10^15, which the
+; pinned Aura cannot take back across c-func; see sink_abi.h); on overflow the kernel stops (goto ovf_exit), records it
+; in a thread-local status and returns 0. The status is exported as
+; <symbol>_overflowed (() -> Int, read-and-clear); sink-plan:bind-body wraps
+; generated Int kernels so a nonzero status raises an Aura error
+; ("sink: int overflow ...") instead of returning the sentinel. Aura Soft has
+; no defined result here (it SIGABRTs, aura#4462), so fail-closed is the match.
+; Float kernels are IEEE double, unchecked (Aura Float is double too).
 
 (export kgen:compile kgen:compile-float kgen:compile-kind kgen:symbol kgen:base kgen:supported? kgen:emit! kgen:print)
 
@@ -82,11 +92,18 @@
 (define (kg-arith op args env loops)
   (let loop ((xs args) (acc "") (first #t))
     (if (null? xs)
-        (kg-ok (string-append "(" acc ")"))
+        (kg-ok (if kg-float-mode (string-append "(" acc ")") acc))
         (let ((r (kg-expr (car xs) env loops)))
           (if (kg-ok? r)
-              (loop (cdr xs) (string-append acc (if first "" (string-append " " op " ")) (kg-val r)) #f)
+              (loop (cdr xs)
+                    (cond (first (kg-val r))
+                          (kg-float-mode (string-append acc " " op " " (kg-val r)))
+                          ; Int: left fold, one checked op per step (as Aura)
+                          (else (string-append (kg-checked op) "(" acc ", " (kg-val r) ", &ovf)")))
+                    #f)
               r)))))
+(define (kg-checked op)
+  (cond ((string=? op "+") "sink_ck_add") ((string=? op "-") "sink_ck_sub") (else "sink_ck_mul")))
 
 (define (kg-expr t env loops)
   (cond
@@ -109,7 +126,10 @@
          ((string=? h "*") (kg-arith "*" args env loops))
          ((and (string=? h "-") (= (kg-len args) 1))
           (let ((r (kg-expr (car args) env loops)))
-            (if (kg-ok? r) (kg-ok (string-append "(-" (kg-val r) ")")) r)))
+            (if (kg-ok? r)
+                (kg-ok (if kg-float-mode (string-append "(-" (kg-val r) ")")
+                           (string-append "sink_ck_neg(" (kg-val r) ", &ovf)")))
+                r)))
          ((and (string=? h "-") (> (kg-len args) 1)) (kg-arith "-" args env loops))
          ((and (string=? h "if") (= (kg-len args) 3))
           (let ((c (kg-cond (car args) env loops))
@@ -167,7 +187,7 @@
         (kg-err (string-append "arity mismatch in call to " (car loop)))
         (let walk ((xs args) (vs cvars) (k 0) (decl "") (asg ""))
           (if (null? xs)
-              (kg-ok (string-append ind "{\n" decl asg ind "  goto top_" d ";\n" ind "}\n"))
+              (kg-ok (string-append ind "{\n" decl (kg-ovf-check (string-append ind "  ")) asg ind "  goto top_" d ";\n" ind "}\n"))
               (let ((r (kg-expr (car xs) env loops)) (tmp (string-append "t" d "_" (number->string k))))
                 (if (kg-ok? r)
                     (walk (cdr xs) (cdr vs) (+ k 1)
@@ -203,7 +223,7 @@
               (let ((r (kg-stmt body (kg-bind params cvars env)
                                 (cons (list name d cvars) loops) (string-append ind "  "))))
                 (if (kg-ok? r)
-                    (kg-ok (string-append ind "{\n" decl ind "top_" (number->string d) ": ;\n" (kg-val r) ind "}\n"))
+                    (kg-ok (string-append ind "{\n" decl (kg-ovf-check (string-append ind "  ")) ind "top_" (number->string d) ": ;\n" (kg-val r) ind "}\n"))
                     r))
               (let ((r (kg-expr (car xs) env loops)))
                 (if (kg-ok? r)
@@ -225,7 +245,17 @@
      (kg-err (string-append "unsupported form " (car t))))
     (else
      (let ((r (kg-expr t env loops)))
-       (if (kg-ok? r) (kg-ok (string-append ind "return " (kg-val r) ";\n")) r)))))
+       (if (kg-ok? r)
+           (kg-ok (if kg-float-mode
+                      (string-append ind "return " (kg-val r) ";\n")
+                      (string-append ind "{\n" ind "  int64_t r_ = " (kg-val r) ";\n"
+                                     ind "  if (sink_ck_ret(r_, ovf)) goto ovf_exit;\n"
+                                     ind "  return r_;\n" ind "}\n")))
+           r)))))
+
+; Int only: leave the kernel as soon as an arithmetic step overflowed.
+(define (kg-ovf-check ind)
+  (if kg-float-mode "" (string-append ind "if (ovf) goto ovf_exit;\n")))
 
 (define (member-of? x xs) (cond ((null? xs) #f) ((equal? x (car xs)) #t) (else (member-of? x (cdr xs)))))
 
@@ -268,11 +298,16 @@
             (string-append
              "/* GENERATED by lib/kgen.aura (" (kg-kind) " kernel) from the workspace define `" name "`. Do not edit. */\n"
              "#include <stdint.h>\n#include \"sink_abi.h\"\nAURA_SINK_MODULE\n\n"
+             (if kg-float-mode "" (string-append "AURA_SINK_OVF_DECL(" (kgen:symbol name) ")\n"))
              "AURA_SINK_EXPORT " (kg-ret-ty) " " (kgen:symbol name) "(" (kg-params (string-append (kg-ret-ty) " a") n) ") {\n"
+             (if kg-float-mode "" "  int ovf = 0;\n")
              (kg-decl0 cvars 0)
              "top_0: ;\n"
              (kg-val r)
-             "}\n")))))))
+             (if kg-float-mode ""
+                 (string-append "ovf_exit:\n  " (kgen:symbol name) "_ovf_ = 1;\n  return 0;\n"))
+             "}\n"
+             (if kg-float-mode "" (string-append "AURA_SINK_OVF_STATUS(" (kgen:symbol name) ")\n")))))))))
 
 (define (kg-decl0 cvars k)
   (if (null? cvars) ""

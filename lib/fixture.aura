@@ -17,7 +17,7 @@
 ; workload run (no hard-coded profile any more). ms-per-call is measured;
 ; static call sites come from (query:calls name).
 
-(export fixture:workspace-code
+(export fixture:overflow-src fixture:overflow-names fixture:workspace-code
         fixture:float-workspace-code
         fixture:float-literal-src
         fixture:kind
@@ -106,6 +106,19 @@
 ; reference is a host-file define, where literals evaluate correctly).
 (define (fixture:float-literal-src)
   "(define fpoly (lambda (x) (+ (* 1.5 x x) (* 0.25 x) -2.0)))")
+
+;; Overflow-checked Int kernels (kernels/sink_abi.h sink_ck_*): one define per
+;; checked op, plus the (+ c c 2) chain shape of aura#4462. Host-file defines
+;; with the same bodies are the Aura reference for in-range inputs.
+(define (fixture:overflow-src)
+  (string-append
+   "(define ov-add (lambda (a b) (+ a b)))\n"
+   "(define ov-sub (lambda (a b) (- a b)))\n"
+   "(define ov-mul (lambda (a b) (* a b)))\n"
+   "(define ov-neg (lambda (a) (- a)))\n"
+   "(define ov-chain (lambda (c) (+ c c 2)))\n"
+   "(define ov-pow (lambda (b k) (letrec ((lp (lambda (i acc) (if (< i k) (lp (+ i 1) (* acc b)) acc)))) (lp 0 1))))\n"))
+(define (fixture:overflow-names) (list "ov-add" "ov-sub" "ov-mul" "ov-neg" "ov-chain" "ov-pow"))
 
 ; c-func scalar kind of a fixture candidate.
 (define (fixture:kind name) (if (string=? name "hot-fsum") "Float" "Int"))

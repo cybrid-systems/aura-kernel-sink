@@ -26,3 +26,7 @@
 ; Float literals: fpoly is not a workspace define (aura#4475), kind given.
 (define prows (kgen:emit! (discover:defines (discover:read (fixture:float-literal-src))) (list (list "fpoly" "Float")) dir))
 (kgen:print prows)
+; Overflow-checked Int kernels (tests/test_kgen_overflow.aura).
+(define orows (kgen:emit! (discover:defines (discover:read (fixture:overflow-src))) (fixture:overflow-names) dir))
+(display "== kgen: overflow fixtures -> build/gen/*.c") (newline)
+(kgen:print orows)

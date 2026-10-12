@@ -23,6 +23,7 @@
         sink-plan:wrapper
         sink-plan:fake
         sink-plan:bind-body
+        sink-plan:checked?
         sink-plan:steps
         sink-plan:print)
 
@@ -66,8 +67,30 @@
 ; Body that binds the slot to the C procedure, evaluated inside the workspace.
 ; lib is the c-load handle index.
 (define (sink-plan:bind-body p lib)
-  (string-append "(c-func " (number->string lib) " \"" (sink-plan:symbol p) "\" \""
-                 (sink-plan:sig p) "\")"))
+  (if (sink-plan:checked? p)
+      (sink-plan-checked-body p lib)
+      (sink-plan-cfunc p lib (sink-plan:symbol p) (sink-plan:sig p))))
+
+(define (sink-plan-cfunc p lib sym sig)
+  (string-append "(c-func " (number->string lib) " \"" sym "\" \"" sig "\")"))
+
+; Generated Int kernels (lib/kgen.aura) are overflow-checked: they export
+; <symbol>_overflowed (() -> Int, read-and-clear). The slot is bound to a
+; closure that calls the kernel, then the status, and raises an Aura error on
+; overflow, so the kernel's 0 sentinel is never returned (fail closed).
+(define (sink-plan-prefix? pre s)
+  (and (>= (string-length s) (string-length pre))
+       (string=? (substring s 0 (string-length pre)) pre)))
+(define (sink-plan:checked? p)
+  (and (sink-plan-prefix? "sink_gen_" (sink-plan:symbol p))
+       (sink-plan-prefix? "(Int" (sink-plan:sig p))))
+(define (sink-plan-checked-body p lib)
+  (let ((args (sink-plan-args (sink-plan:arity p))))
+    (string-append
+     "(let ((k " (sink-plan-cfunc p lib (sink-plan:symbol p) (sink-plan:sig p)) ") "
+     "(o " (sink-plan-cfunc p lib (string-append (sink-plan:symbol p) "_overflowed") "() -> Int") ")) "
+     "(lambda (" args ") (let ((r (k " args "))) "
+     "(if (= (o) 0) r (error \"sink: int overflow in " (sink-plan:name p) " (outside Aura Int range)\")))))")))
 
 ; The exact primitive sequence loop.aura runs for this plan (documentation and
 ; trace output; nothing here is executed).

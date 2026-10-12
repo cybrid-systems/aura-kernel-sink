@@ -1,0 +1,105 @@
+;; tests/test_kgen_overflow.aura — Int kernels use checked fixnum arithmetic.
+;; Golden: in-range inputs (including the fixnum edges) equal the Aura body.
+;; Overflow: any + - * leaving [-2^62, 2^62-1] makes the kernel return 0 and
+;; set <symbol>_overflowed; through the sink wrapper it is an Aura error.
+;; Aura Soft itself SIGABRTs on these inputs (aura#4462), so no Aura reference
+;; is evaluated for them.
+(require "expect" all:)
+(require "fixture" all:)
+(require "discover" all:)
+(require "kgen" all:)
+(require "plant" all:)
+(require "loop" all:)
+(require "harness" all:)
+(require "sink_plan" all:)
+(require "std/ffi" all:)
+(require "std/fs" all:)
+(display "RUN-ONCE") (newline)
+(define plant (plant:real))
+
+(define (has-sub? s sub)
+  (let ((n (string-length s)) (m (string-length sub)))
+    (let loop ((i 0)) (cond ((> (+ i m) n) #f) ((string=? (substring s i (+ i m)) sub) #t) (else (loop (+ i 1)))))))
+
+; Aura references (host defines, same bodies as fixture:overflow-src)
+(define (ov-add a b) (+ a b))
+(define (ov-sub a b) (- a b))
+(define (ov-mul a b) (* a b))
+(define (ov-neg a) (- a))
+(define (ov-chain c) (+ c c 2))
+(define (ov-pow b k) (let lp ((i 0) (acc 1)) (if (< i k) (lp (+ i 1) (* acc b)) acc)))
+
+(define fmax 4611686018427387903)      ; 2^62-1
+;; Negative Int at or below -5*10^15 is not usable from Aura on the pinned tip: literals
+;; and results read as Float (aura bug, see IMPROVEMENTS.md), and a Float cannot
+;; be passed to an (Int ..) c-func. Negative edges here stay at -2^52.
+(define nedge -4503599627370496)       ; -2^52
+(define half 2305843009213693951)      ; 2^61-1
+
+(define (kern name sig)
+  (let ((lib (c-load (fixture:so (kgen:base name)))))
+    (list (c-func lib (kgen:symbol name) sig)
+          (c-func lib (string-append (kgen:symbol name) "_overflowed") "() -> Int"))))
+(define (k-f k) (car k))
+(define (k-o k) (car (cdr k)))
+
+(define kadd (kern "ov-add" "(Int Int) -> Int"))
+(define ksub (kern "ov-sub" "(Int Int) -> Int"))
+(define kmul (kern "ov-mul" "(Int Int) -> Int"))
+(define kneg (kern "ov-neg" "(Int) -> Int"))
+(define kchain (kern "ov-chain" "(Int) -> Int"))
+(define kpow (kern "ov-pow" "(Int Int) -> Int"))
+(expect "overflow kernels built and resolve (kernel + _overflowed)"
+        (and (procedure? (k-f kadd)) (procedure? (k-o kadd)) (procedure? (k-f kpow)) (procedure? (k-o kchain))))
+
+; in range: same as Aura, status 0
+(define (same2 k ref a b) (let ((r ((k-f k) a b))) (and (= ((k-o k)) 0) (= r (ref a b)))))
+(define (same1 k ref a) (let ((r ((k-f k) a))) (and (= ((k-o k)) 0) (= r (ref a)))))
+(define (ovf2 k a b) (let ((r ((k-f k) a b))) (let ((o ((k-o k)))) (and (= r 0) (= o 1) (= ((k-o k)) 0)))))
+(define (ovf1 k a) (let ((r ((k-f k) a))) (let ((o ((k-o k)))) (and (= r 0) (= o 1) (= ((k-o k)) 0)))))
+(expect "golden add: edges in range == Aura" (and (same2 kadd ov-add half half) (same2 kadd ov-add fmax 0) (same2 kadd ov-add fmax -1) (same2 kadd ov-add 3 4) (same2 kadd ov-add nedge -1)))
+(expect "golden sub: edges in range == Aura" (and (same2 ksub ov-sub fmax 1) (same2 ksub ov-sub 0 4503599627370495) (same2 ksub ov-sub -5 9)))
+(expect "golden mul: edges in range == Aura" (and (same2 kmul ov-mul 2147483648 1073741824) (same2 kmul ov-mul fmax 1) (same2 kmul ov-mul -3 7) (same2 kmul ov-mul -2 2251799813685248)))
+(expect "golden neg: == Aura" (and (same1 kneg ov-neg 4503599627370496) (same1 kneg ov-neg nedge) (same1 kneg ov-neg 0)))
+(expect "neg of 2^62-1: in fixnum, refused by the return guard" (ovf1 kneg fmax))
+(expect "golden chain (+ c c 2): in range == Aura" (and (same1 kchain ov-chain 1000) (same1 kchain ov-chain (- half 1))))
+(expect "golden pow loop: 3^39, 2^61, (-2)^51 == Aura" (and (same2 kpow ov-pow 3 39) (same2 kpow ov-pow 2 61) (same2 kpow ov-pow -2 51)))
+
+; overflow: kernel returns 0 + status 1, and the status clears after one read
+(expect "overflow add: 2^62-1 + 1 (past fixnum, inside int64) -> fail closed" (ovf2 kadd fmax 1))
+(expect "overflow add: (2^62-1)+(2^62-1) -> fail closed" (ovf2 kadd fmax fmax))
+(expect "overflow sub: -2^52 - (2^62-1) -> fail closed" (ovf2 ksub nedge fmax))
+(expect "overflow mul: (-2)^63 via loop -> fail closed" (ovf2 kpow -2 63))
+(expect "overflow mul: 2^31 * 2^31 (= 2^62) -> fail closed" (ovf2 kmul 2147483648 2147483648))
+(expect "overflow mul: past int64 (2^32 * 2^32) -> fail closed" (ovf2 kmul 4294967296 4294967296))
+(expect "overflow chain: (+ c c 2) at c=2^61-1 (aura#4462 shape) -> fail closed" (ovf1 kchain half))
+(expect "overflow pow loop: 2^62 stops the loop -> fail closed" (ovf2 kpow 2 62))
+(expect "overflow pow loop: 3^1000000 stops at the first overflow (no runaway)" (ovf2 kpow 3 1000000))
+(expect "return guard: result -(2^62-1) (in fixnum, but the pinned Aura reads it back corrupt) -> fail closed" (ovf2 ksub 0 fmax))
+(expect "return guard: -5*10^15 result -> fail closed, -4999999999999999 passes (== Aura)" (and (ovf2 ksub 0 5000000000000000) (ovf2 ksub 0 9007199254740992) (same2 ksub ov-sub 0 4999999999999999)))
+(expect "chain (+ c c 2) at c=-3 == Aura (small negatives pass the return guard)" (same1 kchain ov-chain -3))
+(expect "status is per call: next in-range call is clean" (same2 kadd ov-add 1 2))
+
+; generated Int plans get the checked slot body; Float / hand-written do not
+(define p-gen (sink-plan:make "hot-sum-sq" "x.so" (kgen:symbol "hot-sum-sq") 1 "" ""))
+(define p-hand (sink-plan:make "hot-sum-sq" "x.so" "sink_sum_sq" 1 "" ""))
+(define p-flt (sink-plan:make-kind "hot-fsum" "x.so" (kgen:symbol "hot-fsum") 2 "" "" "Float"))
+(expect "plan: generated Int kernel is checked" (sink-plan:checked? p-gen))
+(expect "plan: hand-written / Float kernels are not" (and (not (sink-plan:checked? p-hand)) (not (sink-plan:checked? p-flt))))
+(expect "plan: checked bind body reads _overflowed and raises"
+        (let ((b (sink-plan:bind-body p-gen 3)))
+          (and (has-sub? b "sink_gen_hot_sum_sq_overflowed") (has-sub? b "(error \"sink: int overflow"))))
+
+; closed loop: sunk hot-sum-sq still accepted; an overflowing call is an Aura error
+(set-code (fixture:workspace-code))
+(eval-current)
+(expect "real: candidates instrumented" (fixture:instrument!))
+(define r #f)
+(set! r (harness:attempt plant "hot-sum-sq" "generated" (sink-min-speedup)))
+(expect "loop: generated checked kernel accepted" (loop:accepted? r))
+(expect "loop: sunk hot-sum-sq correct" (= (hot-sum-sq 100) 328350))
+(define big-res (try (hot-sum-sq 3000000) (catch (e) (list "caught" e))))
+(expect "loop: sunk hot-sum-sq past fixnum range raises sink: int overflow"
+        (and (pair? big-res) (equal? (car big-res) "caught")))
+(expect "loop: sunk hot-sum-sq usable after an overflow" (= (hot-sum-sq 10) 285))
+(expect-summary)

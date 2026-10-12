@@ -30,7 +30,9 @@
 (define r-hot (gen "(define hot-sum-sq (lambda (n) (letrec ((loop (lambda (i s) (if (< i n) (loop (+ i 1) (+ s (* i i))) s)))) (loop 0 0))))" "hot-sum-sq"))
 (expect "kgen hot-sum-sq: generated" (ok? r-hot))
 (expect "kgen hot-sum-sq: exports sink_gen_hot_sum_sq(long a0)" (has-sub? (reason r-hot) "long sink_gen_hot_sum_sq(long a0)"))
-(expect "kgen hot-sum-sq: loop -> goto, s += i*i" (and (has-sub? (reason r-hot) "goto top_") (has-sub? (reason r-hot) "(l2_0 * l2_0)")))
+(expect "kgen hot-sum-sq: loop -> goto, s += i*i (checked)" (and (has-sub? (reason r-hot) "goto top_") (has-sub? (reason r-hot) "sink_ck_add(l2_1, sink_ck_mul(l2_0, l2_0, &ovf), &ovf)")))
+(expect "kgen hot-sum-sq: overflow exit + status export" (and (has-sub? (reason r-hot) "if (ovf) goto ovf_exit;") (has-sub? (reason r-hot) "AURA_SINK_OVF_STATUS(sink_gen_hot_sum_sq)")))
+(expect "kgen hot-sum-sq: no unchecked int64 op left" (not (has-sub? (reason r-hot) " + ")))
 (expect "kgen hot-sum-sq: carries aot_emit_version (AURA_SINK_MODULE)" (has-sub? (reason r-hot) "AURA_SINK_MODULE"))
 (expect "kgen cold-add: generated, 2 params" (has-sub? (reason (gen "(define cold-add (lambda (a b) (+ a b)))" "cold-add")) "(long a0, long a1)"))
 (expect "kgen tail self-recursion: generated as goto top_0"

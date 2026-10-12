@@ -3,8 +3,9 @@
 # lib/kgen.aura, see scripts/gen_kernel.sh) into build/kernels/lib<name>.so.
 #   CC      C compiler (default: cc)
 #   CFLAGS  extra flags (default: -O2)
-# Generated sources also get -fwrapv (int64 wraparound, never UB) and no
-# unused-label / unused-variable errors (the generator emits uniform labels).
+# Generated sources get no unused-label / unused-variable errors (the generator
+# emits uniform labels). No -fwrapv: Int kernels use checked arithmetic
+# (sink_ck_add/sub/mul/neg in sink_abi.h, fixnum range, fail-closed).
 set -euo pipefail
 here="$(cd "$(dirname "$0")" && pwd)"
 root="$(cd "$here/.." && pwd)"
@@ -26,5 +27,5 @@ build_one() {  # src extra-flags tag
 }
 for src in "$here"/*.c; do build_one "$src" "" ""; done
 for src in "$root"/build/gen/*.c; do
-  build_one "$src" "-fwrapv -Wno-unused-label -Wno-unused-variable" " (generated)"
+  build_one "$src" "-Wno-unused-label -Wno-unused-variable" " (generated)"
 done
