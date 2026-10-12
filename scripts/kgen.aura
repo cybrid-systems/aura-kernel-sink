@@ -8,6 +8,21 @@
 (eval-current)
 (define defs (discover:defines (discover:scan)))
 (define (names rows) (if (null? rows) (list) (cons (car (car rows)) (names (cdr rows)))))
-(define rows (kgen:emit! defs (names (discover:candidates defs)) (string-append (fixture:root) "/build/gen")))
-(display "== kgen: discovered candidates -> build/gen/*.c") (newline)
+(define dir (string-append (fixture:root) "/build/gen"))
+(define rows (kgen:emit! defs (discover:kinds (discover:candidates defs)) dir))
+(display "== kgen: discovered candidates (Int workspace) -> build/gen/*.c") (newline)
 (kgen:print rows)
+; Float workspace: hot-fsum is classified Float and gets a double kernel.
+(set-code (fixture:float-workspace-code))
+(eval-current)
+(define fdefs (discover:defines (discover:scan)))
+; Live type feedback: count + sample a workload window, then retype.
+(define fcands (discover:candidates fdefs))
+(discover:instrument! fcands)
+(discover:observe (lambda () (app-workload-f 20 0.5)))
+(define frows (kgen:emit! fdefs (discover:kinds (discover:retype! fcands)) dir))
+(display "== kgen: discovered candidates (Float workspace) -> build/gen/*.c") (newline)
+(kgen:print frows)
+; Float literals: fpoly is not a workspace define (aura#4475), kind given.
+(define prows (kgen:emit! (discover:defines (discover:read (fixture:float-literal-src))) (list (list "fpoly" "Float")) dir))
+(kgen:print prows)

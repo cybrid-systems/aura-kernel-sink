@@ -1,0 +1,103 @@
+; tests/test_kgen_float.aura — Float C kernels (lib/kgen.aura, kind "Float"):
+; double code for Float-callable leaf defines, golden match against Aura,
+; accepted in the closed loop with a speedup, non-Float rejected.
+; run_tests.sh runs scripts/gen_kernel.sh first (build/kernels/libgen_*.so).
+(require "expect" all:)
+(require "fixture" all:)
+(require "discover" all:)
+(require "kgen" all:)
+(require "plant" all:)
+(require "loop" all:)
+(require "sink_plan" all:)
+(require "harness" all:)
+(require "std/ffi" all:)
+(require "std/fs" all:)
+(require "std/hot-strategy" all:)
+(display "RUN-ONCE") (newline)
+
+(define plant (plant:real))
+(define (has-sub? s sub)
+  (let ((n (string-length s)) (m (string-length sub)))
+    (let loop ((i 0)) (cond ((> (+ i m) n) #f) ((string=? (substring s i (+ i m)) sub) #t) (else (loop (+ i 1)))))))
+(define (tree src) (car (cdr (car (discover:defines (discover:read src))))))
+(define (genf src name) (kgen:compile-float name (tree src)))
+(define (ok? r) (equal? (car r) #t))
+(define (reason r) (car (cdr r)))
+
+; ---- static: Float subset
+(define r-poly (genf (fixture:float-literal-src) "fpoly"))
+(expect "float fpoly: generated" (ok? r-poly))
+(expect "float fpoly: double sink_gen_fpoly(double a0)" (has-sub? (reason r-poly) "double sink_gen_fpoly(double a0)"))
+(expect "float fpoly: literals 1.5 0.25 -2.0 kept as C doubles"
+        (and (has-sub? (reason r-poly) "(1.5)") (has-sub? (reason r-poly) "(0.25)") (has-sub? (reason r-poly) "(-2.0)")))
+(expect "float fpoly: tagged Float kernel" (has-sub? (reason r-poly) "(Float kernel)"))
+(define r-fsum (genf "(define hot-fsum (lambda (n h) (letrec ((loop (lambda (i s) (if (< i n) (loop (+ i 1) (+ s (* h i i))) s)))) (loop 0 (- h h)))))" "hot-fsum"))
+(expect "float hot-fsum: generated, 2 double params" (has-sub? (reason r-fsum) "double sink_gen_hot_fsum(double a0, double a1)"))
+(expect "float hot-fsum: loop vars double, int literal 0 -> 0.0, goto"
+        (and (has-sub? (reason r-fsum) "double l2_0 = (0.0);") (has-sub? (reason r-fsum) "(l0_1 - l0_1)") (has-sub? (reason r-fsum) "goto top_2") (not (has-sub? (reason r-fsum) "int64_t"))))
+(expect "float tail self-recursion + comparisons: generated"
+        (has-sub? (reason (genf "(define fc (lambda (x acc) (if (<= x 0.0) acc (fc (- x 1.0) (+ acc 0.5)))))" "fc")) "goto top_0"))
+(expect "float int literal 2 -> (2.0)" (has-sub? (reason (genf "(define f2 (lambda (x) (* 2 x)))" "f2")) "(2.0)"))
+; ---- non-Float rejected with a reason
+(expect "float: string result skipped" (has-sub? (reason (genf "(define l (lambda (n) (if (> n 0) \"a\" \"b\")))" "l")) "string literal (not Float)"))
+(expect "float: boolean result skipped" (has-sub? (reason (genf "(define p (lambda (x) #f))" "p")) "boolean value (not Float)"))
+(expect "float: division skipped" (has-sub? (reason (genf "(define d (lambda (x) (/ x 2.0)))" "d")) "division"))
+(expect "float: call into another define skipped" (has-sub? (reason (genf "(define g (lambda (x) (sqrt x)))" "g")) "unsupported call sqrt"))
+(expect "Int kernel still rejects float literal" (has-sub? (reason (kgen:compile "fpoly" (tree (fixture:float-literal-src)))) "non-integer literal"))
+(expect "kind #f: skipped" (not (ok? (kgen:compile-kind "c" (tree "(define c (lambda (a b) (+ a b)))") #f))))
+
+; ---- discover classifies kinds in the Float workspace
+(set-code (fixture:float-workspace-code))
+(eval-current)
+(define defs (discover:defines (discover:scan)))
+(define cands0 (discover:candidates defs))
+(define cands cands0)
+(define (kind-of n) (let f ((cs cands)) (cond ((null? cs) "absent") ((string=? (car (car cs)) n) (discover:kind (car cs))) (else (f (cdr cs))))))
+(expect "discover static: hot-fsum Int-callable first (numeric body, no float literal)" (equal? (kind-of "hot-fsum") "Int"))
+(expect "discover: Float workspace instrumented" (discover:instrument! cands0))
+(define live (discover:observe (lambda () (app-workload-f 20 0.5))))
+(expect "live window: hot-fsum called 20x, last first arg a float" (= (live "hot-fsum") 20))
+(set! cands (discover:retype! cands0))
+(expect "discover:retype!: hot-fsum kind Float (live type feedback)" (equal? (kind-of "hot-fsum") "Float"))
+(expect "discover: cold-add kind Int" (equal? (kind-of "cold-add") "Int"))
+(expect "discover: label-of kind #f" (equal? (kind-of "label-of") #f))
+(expect "discover: app-workload-f not a candidate (not a leaf)" (equal? (kind-of "app-workload-f") "absent"))
+(define rows (kgen:emit! defs (discover:kinds cands) "/tmp"))
+(define (row-of n) (let f ((rs rows)) (cond ((null? rs) #f) ((string=? (car (car rs)) n) (car rs)) (else (f (cdr rs))))))
+(expect "emit!: hot-fsum generated as Float" (and (string=? (car (cdr (row-of "hot-fsum"))) "generated") (has-sub? (read-file "/tmp/gen_hot_fsum.c") "double sink_gen_hot_fsum")))
+(expect "emit!: cold-add still Int" (has-sub? (read-file "/tmp/gen_cold_add.c") "long sink_gen_cold_add"))
+(expect "emit!: label-of skipped" (string=? (car (cdr (row-of "label-of"))) "skipped"))
+(expect "gen_kernel.sh built libgen_hot_fsum.so and libgen_fpoly.so"
+        (and (file-exists? (fixture:so (kgen:base "hot-fsum"))) (file-exists? (fixture:so (kgen:base "fpoly")))))
+
+; ---- golden: kernel == Aura
+(define fpoly-ref (lambda (x) (+ (* 1.5 x x) (* 0.25 x) -2.0)))  ; host define: literals are fine here
+(define poly-k (c-func (c-load (fixture:so (kgen:base "fpoly"))) "sink_gen_fpoly" "(Float) -> Float"))
+(define fsum-k (c-func (c-load (fixture:so (kgen:base "hot-fsum"))) "sink_gen_hot_fsum" "(Float Float) -> Float"))
+(define (all-eq? f g xs)
+  (cond ((null? xs) #t)
+        ((equal? (f (car xs)) (g (car xs))) (all-eq? f g (cdr xs)))
+        (else (display "  mismatch at ") (display (car xs)) (display " ") (display (f (car xs))) (display " vs ") (display (g (car xs))) (newline) #f)))
+(expect "golden: fpoly kernel == Aura (bit-equal)" (all-eq? poly-k fpoly-ref (list 0.0 1.0 -1.0 2.5 -3.75 100.0 12345.5 0.001)))
+(expect "golden: hot-fsum kernel == workspace hot-fsum (bit-equal)"
+        (all-eq? (lambda (x) (fsum-k (+ 0.0 x) 0.5)) (lambda (x) (hot-fsum (+ 0.0 x) 0.5)) (fixture:cases "hot-fsum")))
+(expect "golden: hot-fsum h=0.1 (inexact) still bit-equal"
+        (all-eq? (lambda (x) (fsum-k (+ 0.0 x) 0.1)) (lambda (x) (hot-fsum (+ 0.0 x) 0.1)) (list 7 100 999)))
+(expect "golden: result is a float" (float? (fsum-k 10.0 0.5)))
+
+; ---- closed loop
+(define r-bad #f)
+(define r #f)
+; Same .so bound with an Int signature: wrong results, rejected and healed.
+(define bad-plan (sink-plan:make "hot-fsum" (fixture:so (kgen:base "hot-fsum")) (kgen:symbol "hot-fsum") 2
+                                 (fixture:aura-body "hot-fsum") ""))
+(set! r-bad (loop:sink-one bad-plan plant (fixture:probe "hot-fsum") (fixture:cases "hot-fsum") 5000 60 (sink-min-speedup)))
+(loop:print r-bad)
+(expect "loop: Float kernel bound as Int rejected (wrong-result) and healed"
+        (and (not (loop:accepted? r-bad)) (loop:rollback-ok? r-bad)))
+(set! r (harness:attempt plant "hot-fsum" "generated" (sink-min-speedup)))
+(expect "loop: generated Float kernel accepted" (loop:accepted? r))
+(expect "loop: speedup >= sink-min-speedup" (>= (loop:speedup r) (sink-min-speedup)))
+(expect "loop: sunk hot-fsum correct" (equal? (hot-fsum 100.0 0.5) 164175.0))
+(expect "loop: sunk hot-fsum still counted" (= ((discover:observe (lambda () (app-workload-f 3 0.5))) "hot-fsum") 3))
+(expect-summary)

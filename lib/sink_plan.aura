@@ -4,13 +4,15 @@
 ;   slot     workspace define that holds the C procedure: sink-kernel-<name>
 ;   so       kernel shared object (built by kernels/build.sh)
 ;   symbol   exported C symbol
-;   sig      c-func signature, Int-only for the MVP: "(Int Int) -> Int"
+;   sig      c-func signature: "(Int Int) -> Int" or, for a Float kernel
+;            (sink-plan:make-kind ... "Float"), "(Float Float) -> Float"
 ;   wrapper  new body for <name>: a thin call through the slot
 ;   fake     Aura stand-in body used by the FakePlant (no .so involved)
 ;
 ; Plan list: (name slot so symbol sig arity aura-body wrapper fake)
 
 (export sink-plan:make
+        sink-plan:make-kind
         sink-plan:name
         sink-plan:slot
         sink-plan:so
@@ -34,16 +36,20 @@
               (string-append acc (if (= i 0) "" " ") "a" (number->string i)))
         acc)))
 
-(define (sink-plan-sig arity)
+(define (sink-plan-sig arity kind)
   (let loop ((i 0) (acc ""))
     (if (< i arity)
-        (loop (+ i 1) (string-append acc (if (= i 0) "" " ") "Int"))
-        (string-append "(" acc ") -> Int"))))
+        (loop (+ i 1) (string-append acc (if (= i 0) "" " ") kind))
+        (string-append "(" acc ") -> " kind))))
 
 (define (sink-plan:make name so symbol arity aura-body fake)
+  (sink-plan:make-kind name so symbol arity aura-body fake "Int"))
+
+; kind: "Int" | "Float" (the c-func scalar type of every argument and the result)
+(define (sink-plan:make-kind name so symbol arity aura-body fake kind)
   (let ((slot (string-append "sink-kernel-" name))
         (args (sink-plan-args arity)))
-    (list name slot so symbol (sink-plan-sig arity) arity aura-body
+    (list name slot so symbol (sink-plan-sig arity kind) arity aura-body
           (string-append "(lambda (" args ") (" slot " " args "))")
           fake)))
 

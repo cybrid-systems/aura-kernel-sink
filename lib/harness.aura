@@ -8,7 +8,7 @@
 (require "loop" all:)
 
 (define (harness:row name)
-  (let find ((rows (fixture:candidates)))
+  (let find ((rows (append (fixture:candidates) (fixture:float-candidates))))
     (cond ((null? rows) #f)
           ((string=? (car (car rows)) name) (car rows))
           (else (find (cdr rows))))))

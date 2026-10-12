@@ -13,6 +13,9 @@
 ;     The bump is inlined rather than a sink-tick! helper define because a
 ;     workspace with 9+ procedure defines runs ~35x slower on the pinned tip
 ;     (aura#4479), and every helper counts.
+;   * the same wrapper also records its first argument in `sink-argf` slot i
+;     (live type feedback: discover:retype! turns an Int-callable candidate
+;     whose live calls pass floats into a Float kernel candidate);
 ;   * the sink wrapper is counted the same way (counter:wrap), so a sunk
 ;     define keeps reporting calls and rollback restores a counted body.
 ;
@@ -28,7 +31,8 @@
         counter:instrument!
         counter:reset!
         counter:count
-        counter:observe)
+        counter:observe
+        counter:last-arg)
 
 (define (counter-args arity)
   (let loop ((i 0) (acc ""))
@@ -39,15 +43,17 @@
 ; Workspace defines for n counter slots.
 (define (counter:workspace-code n)
   (string-append
-   "(define sink-calls (make-vector " (number->string n) " 0))\n"))
+   "(define sink-calls (make-vector " (number->string n) " 0))\n"
+   "(define sink-argf (make-vector " (number->string n) " 0))\n"))
 
 ; Counting wrapper around `body` (a define name, or a lambda source string;
 ; prefer a name: an inline lambda allocates a closure on every call).
 (define (counter:wrap body index arity)
   (let ((args (counter-args arity)))
     (string-append "(lambda (" args ") (vector-set! sink-calls " (number->string index)
-                   " (+ 1 (vector-ref sink-calls " (number->string index) "))) ("
-                   body (if (= arity 0) "" " ") args "))")))
+                   " (+ 1 (vector-ref sink-calls " (number->string index) "))) "
+                   (if (= arity 0) "" (string-append "(vector-set! sink-argf " (number->string index) " a0) "))
+                   "(" body (if (= arity 0) "" " ") args "))")))
 
 ; Hot-swap define `name` into its counting wrapper. Returns #t or the
 ; mutate:rebind failure value. Caller runs eval-current (which zeroes counters).
@@ -57,11 +63,13 @@
 (define (counter:reset!)
   (let loop ((i 0))
     (if (< i (vector-length sink-calls))
-        (begin (vector-set! sink-calls i 0) (loop (+ i 1)))
+        (begin (vector-set! sink-calls i 0) (vector-set! sink-argf i 0) (loop (+ i 1)))
         #t)))
 
 (define (counter-nth l k) (if (= k 0) (car l) (counter-nth (cdr l) (- k 1))))
 (define (counter:count index) (vector-ref sink-calls index))
+; First argument of the last counted call in slot index (0 if none).
+(define (counter:last-arg index) (vector-ref sink-argf index))
 
 ; Reset, run (thunk) — the live workload — and return a procedure
 ; index -> calls observed during that run.

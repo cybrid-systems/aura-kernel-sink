@@ -5,7 +5,12 @@
 ; Output: (list #t c-source) or (list #f reason). Never a guessed kernel: any
 ; form outside the subset below is a skip with a reason.
 ;
-; Supported subset (Int -> Int, fixnum arithmetic):
+; Two kernel types, chosen per define by the caller (discover classifies):
+;   Int    kgen:compile        int64_t / C long, fixnum arithmetic
+;   Float  kgen:compile-float  double; float literals allowed, integer
+;          literals become doubles (Aura mixes them exactly below 2^53)
+;
+; Supported subset (shared by both types):
 ;   expressions  integer literals, parameters / loop variables,
 ;                (+ e ...) (- e ...) (* e ...), (if COND e e)
 ;   conditions   (< a b) (> a b) (<= a b) (>= a b) (= a b), (and ..) (or ..)
@@ -14,14 +19,21 @@
 ;                a letrec loop -> goto (named let desugars to
 ;                (letrec ((L (lambda (v ..) BODY))) (L init ..)));
 ;                anything else -> return EXPR
-; Rejected with a reason: string / float / boolean values, other calls
+; Rejected with a reason: string / boolean values, float literals in an Int
+; kernel, other calls
 ; (callbacks into Aura are impossible from a kernel), non-tail recursion,
 ; division (Aura error semantics on 0), begin / set! / multi-form bodies.
 ;
 ; Arithmetic is emitted on int64_t and compiled with -fwrapv. The Aura side
 ; is fixnum (|x| < 2^62); the golden cases in score keep results inside both.
 
-(export kgen:compile kgen:symbol kgen:base kgen:supported? kgen:emit! kgen:print)
+(export kgen:compile kgen:compile-float kgen:compile-kind kgen:symbol kgen:base kgen:supported? kgen:emit! kgen:print)
+
+; Current kernel type while one compile runs: #f = Int, #t = Float.
+(define kg-float-mode #f)
+(define (kg-ty) (if kg-float-mode "double" "int64_t"))
+(define (kg-ret-ty) (if kg-float-mode "double" "long"))
+(define (kg-kind) (if kg-float-mode "Float" "Int"))
 
 (define (kg-ok v) (list #t v))
 (define (kg-err r) (list #f r))
@@ -50,6 +62,13 @@
   (and (string? a) (not (kg-strlit? a))
        (let ((n (try (string->number a) (catch (e) #f))))
          (and (number? n) (integer? n) (not (kg-has-dot? a 0))))))
+(define (kg-float-literal? a)
+  (and (string? a) (not (kg-strlit? a))
+       (let ((n (try (string->number a) (catch (e) #f))))
+         (and (number? n) (or (float? n) (integer? n))))))
+; C double literal for an Aura numeric atom; always carries a dot or exponent.
+(define (kg-c-double a)
+  (string-append "(" a (if (kg-has-dot? a 0) "" ".0") ")"))
 (define (kg-has-dot? a i)
   (cond ((>= i (string-length a)) #f)
         ((= (string-ref a i) 46) #t)
@@ -72,8 +91,9 @@
 (define (kg-expr t env loops)
   (cond
     ((string? t)
-     (cond ((kg-strlit? t) (kg-err "string literal (not Int)"))
-           ((or (string=? t "#t") (string=? t "#f")) (kg-err "boolean value (not Int)"))
+     (cond ((kg-strlit? t) (kg-err (string-append "string literal (not " (kg-kind) ")")))
+           ((or (string=? t "#t") (string=? t "#f")) (kg-err (string-append "boolean value (not " (kg-kind) ")")))
+           ((and kg-float-mode (kg-float-literal? t)) (kg-ok (kg-c-double t)))
            ((kg-int-literal? t) (kg-ok (string-append "INT64_C(" t ")")))
            ((kg-lookup t env) (kg-ok (car (cdr (kg-lookup t env)))))
            ((and (string->number t) #t) (kg-err (string-append "non-integer literal " t)))
@@ -83,8 +103,8 @@
     (else
      (let ((h (car t)) (args (cdr t)))
        (cond
-         ((and (string=? h "+") (null? args)) (kg-ok "INT64_C(0)"))
-         ((and (string=? h "*") (null? args)) (kg-ok "INT64_C(1)"))
+         ((and (string=? h "+") (null? args)) (kg-ok (if kg-float-mode "(0.0)" "INT64_C(0)")))
+         ((and (string=? h "*") (null? args)) (kg-ok (if kg-float-mode "(1.0)" "INT64_C(1)")))
          ((string=? h "+") (kg-arith "+" args env loops))
          ((string=? h "*") (kg-arith "*" args env loops))
          ((and (string=? h "-") (= (kg-len args) 1))
@@ -151,7 +171,7 @@
               (let ((r (kg-expr (car xs) env loops)) (tmp (string-append "t" d "_" (number->string k))))
                 (if (kg-ok? r)
                     (walk (cdr xs) (cdr vs) (+ k 1)
-                          (string-append decl ind "  int64_t " tmp " = " (kg-val r) ";\n")
+                          (string-append decl ind "  " (kg-ty) " " tmp " = " (kg-val r) ";\n")
                           (string-append asg ind "  " (car vs) " = " tmp ";\n"))
                     r)))))))
 
@@ -187,7 +207,7 @@
                     r))
               (let ((r (kg-expr (car xs) env loops)))
                 (if (kg-ok? r)
-                    (walk (cdr xs) (cdr vs) (string-append decl ind "  int64_t " (car vs) " = " (kg-val r) ";\n"))
+                    (walk (cdr xs) (cdr vs) (string-append decl ind "  " (kg-ty) " " (car vs) " = " (kg-val r) ";\n"))
                     r)))))))
 
 (define (kg-stmt t env loops ind)
@@ -215,7 +235,21 @@
         (loop (+ k 1) (string-append acc (if (= k 0) "" ", ") s (number->string k))))))
 
 ; name: define name; tree: (lambda (p ..) BODY). Returns (#t c-source) | (#f reason).
-(define (kgen:compile name tree)
+(define (kgen:compile name tree) (kgen:compile-kind name tree "Int"))
+(define (kgen:compile-float name tree) (kgen:compile-kind name tree "Float"))
+
+; kind: "Int" | "Float". Anything else is a skip.
+(define (kgen:compile-kind name tree kind)
+  (cond ((equal? kind "Int") (set! kg-float-mode #f) (kg-compile name tree))
+        ((equal? kind "Float")
+         (set! kg-float-mode #t)
+         (let ((r (kg-compile name tree))) (set! kg-float-mode #f) r))
+        ; not classified: report the precise static reason when there is one
+        (else (set! kg-float-mode #f)
+              (let ((r (kg-compile name tree)))
+                (if (kg-ok? r) (kg-err "not Int- or Float-callable (runtime probe)") r)))))
+
+(define (kg-compile name tree)
   (cond
     ((not (and (pair? tree) (equal? (car tree) "lambda"))) (kg-err "not a lambda"))
     ((not (= (kg-len tree) 3)) (kg-err "body is not a single form"))
@@ -232,9 +266,9 @@
            r
            (kg-ok
             (string-append
-             "/* GENERATED by lib/kgen.aura from the workspace define `" name "`. Do not edit. */\n"
+             "/* GENERATED by lib/kgen.aura (" (kg-kind) " kernel) from the workspace define `" name "`. Do not edit. */\n"
              "#include <stdint.h>\n#include \"sink_abi.h\"\nAURA_SINK_MODULE\n\n"
-             "AURA_SINK_EXPORT long " (kgen:symbol name) "(" (kg-params "long a" n) ") {\n"
+             "AURA_SINK_EXPORT " (kg-ret-ty) " " (kgen:symbol name) "(" (kg-params (string-append (kg-ret-ty) " a") n) ") {\n"
              (kg-decl0 cvars 0)
              "top_0: ;\n"
              (kg-val r)
@@ -242,21 +276,24 @@
 
 (define (kg-decl0 cvars k)
   (if (null? cvars) ""
-      (string-append "  int64_t " (car cvars) " = a" (number->string k) ";\n" (kg-decl0 (cdr cvars) (+ k 1)))))
+      (string-append "  " (kg-ty) " " (car cvars) " = a" (number->string k) ";\n" (kg-decl0 (cdr cvars) (+ k 1)))))
 
 (define (kgen:supported? name tree) (kg-ok? (kgen:compile name tree)))
 
-; Generate one C file per name in names (trees looked up in defs, the
-; discover:defines output) into dir/<base>.c. Returns rows
+; Generate one C file per entry of names (trees looked up in defs, the
+; discover:defines output) into dir/<base>.c. An entry is a name (Int kernel)
+; or (name kind) with kind "Int" | "Float" | #f (#f = skipped). Returns rows
 ;   (name "generated" path) | (name "skipped" reason)
 (define (kgen:emit! defs names dir)
   (let loop ((ns names) (acc (list)))
     (if (null? ns)
         (kg-rev acc)
-        (let* ((name (car ns)) (d (kg-lookup name defs)))
+        (let* ((name (if (pair? (car ns)) (car (car ns)) (car ns)))
+               (kind (if (pair? (car ns)) (car (cdr (car ns))) "Int"))
+               (d (kg-lookup name defs)))
           (if (not d)
               (loop (cdr ns) (cons (list name "skipped" "no such define") acc))
-              (let ((r (kgen:compile name (car (cdr d)))))
+              (let ((r (kgen:compile-kind name (car (cdr d)) kind)))
                 (if (kg-ok? r)
                     (let ((path (string-append dir "/" (kgen:base name) ".c")))
                       (if (equal? (try (write-file path (kg-val r)) (catch (e) #f)) #f)

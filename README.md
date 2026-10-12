@@ -86,6 +86,8 @@ checks: 8 passed, 0 failed
 
 `scripts/gen_kernel.sh` 对发现出的候选逐个生成 C：读 `(query:code)` 里的 define 树，支持整数字面量、参数、`+ - *`、`if`、比较/`and`/`or`/`not` 条件、对自身或 `letrec` 循环（named let 规范化后的形式）的尾调用（编译成 `goto`）。生成 `int64_t` 代码，用 `-fwrapv` 编进 `build/kernels/libgen_<name>.so`，导出 `sink_gen_<name>`，带 `aot_emit_version`，直接走现有 `aot:reload` + `c-func` + `mutate:rebind` + 评分闭环。字符串/浮点/布尔值、调用其他函数、非尾递归、除法（Aura 除零语义）、`begin`/`set!`、把整数当条件（真值语义不同）一律跳过并给出原因，不会生成可疑 kernel。示例：`hot-sum-sq`、`cold-add` 生成成功，`label-of` 因字符串字面量跳过。MVP 先试生成版，生成版被拒才回退手写版；实测生成版加速约 29×，与手写版逐点一致。
 
+**Float kernel**：`kgen:compile-float`（或 `kgen:compile-kind name tree "Float"`）用同一子集生成 `double` 代码：浮点字面量原样保留为 C double，整数字面量变成 `(N.0)`，参数/循环变量/返回值都是 `double`，签名 `(Float ...) -> Float`。类型由 discover 决定：静态上用小整数调用返回整数就是 Int，否则用小浮点调用返回浮点就是 Float；没有浮点字面量的数值函数（如 `hot-fsum`）两者都满足，先当 Int，再靠**活类型反馈**：计数包装同时把首参写进 `sink-argf`，活负载跑完后 `discover:retype!` 把首参是浮点的候选改成 Float。`fixture:float-workspace-code` 是第二个工作区（`hot-fsum`/`cold-add`/`label-of`，与 Int 工作区分开以免超过 8 个过程，#4479）；MVP 第 5 步在里面走完 发现 → 类型反馈 → identify → 生成 double kernel → 闭环，实测约 29–41×，与 Aura 逐位相等。字符串/布尔/除法/调用其他函数在 Float 下同样带原因跳过；Int 路径不变。限制：工作区过程体里的浮点字面量仍读成 0（#4475），所以工作区里的 Float 候选不能写浮点常量（带字面量的 `fpoly` 只在宿主文件里对拍）；Aura 里 `n<=0` 时返回整数 0 而 kernel 返回 0.0，所以 `hot-fsum` 用 `(- h h)` 起步。
+
 ### 什么是真的，什么是替身
 
 | 步骤 | 状态 |
@@ -143,10 +145,10 @@ MVP, pinned to Aura `c4fc6cf23` (RelWithDebInfo, Soft face:
 | `lib/loop.aura` | one attempt: register! → load → rebind slot + wrapper → eval-current → score → accept / heal! + golden re-check |
 | `lib/fixture.aura` | toy workspace: `hot-sum-sq` (hot loop), `cold-add` (trivial), `label-of` (strings), policy, counters, `app-workload` (the live traffic) |
 | `lib/harness.aura`, `lib/expect.aura` | shared attempt runner, PASS/FAIL helper |
-| `lib/kgen.aura` | C kernel generator: define AST -> `int64_t` C, or skip with a reason |
+| `lib/kgen.aura` | C kernel generator: define AST -> `int64_t` (Int) or `double` (Float) C, or skip with a reason |
 | `kernels/` | hand-written fallback `sum_sq.c` (good), `example_add.c` (trivial), `bad_wrong.c`, `bad_slow.c`; `build.sh` builds these and `build/gen/*.c` |
 | `scripts/` | `env.sh`, `run_mvp.sh`, `run_tests.sh`, `mvp.aura`, `gen_kernel.sh` + `kgen.aura` (generate + build) |
-| `tests/` | `test_discover`, `test_identify`, `test_kgen`, `test_score`, `test_loop_real`, `test_loop_fake` (170 checks) |
+| `tests/` | `test_discover`, `test_identify`, `test_kgen`, `test_score`, `test_loop_real`, `test_loop_fake`, `test_kgen_float` (204 checks) |
 | `probes/` | minimal repros of the Aura bugs found while building this |
 
 ### Run
@@ -156,7 +158,7 @@ export AURA_BIN=~/aura/build-rel/aura      # an Aura build; AURA_LIB defaults to
 scripts/run_mvp.sh                         # end to end with real .so files (RealPlant)
 SINK_PLANT=fake scripts/run_mvp.sh         # same loop, Aura stand-in data plane
 scripts/gen_kernel.sh                      # generate build/gen/*.c + build .so (run_* call it)
-scripts/run_tests.sh                       # 6 test files, 170 checks
+scripts/run_tests.sh                       # 7 test files, 204 checks
 ```
 
 The runner fails a test file on a FAIL line, a crash, a non-zero exit, an error
@@ -171,6 +173,8 @@ No hand-written candidate list: `discover:scan` reads `(query:code)`, keeps top-
 ### C kernel generator (`lib/kgen.aura`)
 
 `scripts/gen_kernel.sh` generates C for each discovered candidate from its `(query:code)` define tree. Subset: integer literals, parameters, `+ - *`, `if`, comparison / `and` / `or` / `not` conditions, and tail calls to the define itself or to a `letrec` loop (what named let desugars to), compiled to `goto`. Output is `int64_t` C built with `-fwrapv` into `build/kernels/libgen_<name>.so`, exporting `sink_gen_<name>` plus `aot_emit_version`, so it goes through the existing `aot:reload` + `c-func` + `mutate:rebind` + score loop unchanged. Strings, floats, boolean values, calls to other procedures, non-tail recursion, division (Aura's divide-by-zero semantics), `begin`/`set!`, and Int-as-condition (truthiness differs) are skipped with a reason — never a guessed kernel. On the fixture `hot-sum-sq` and `cold-add` generate, `label-of` is skipped (string literal). The MVP tries the generated kernel first and falls back to the hand-written one only if it is rejected; measured ~29x, identical to the hand-written kernel on all cases.
+
+**Float kernels.** `kgen:compile-float` emits the same subset as `double` C: float literals stay C doubles, integer literals become `(N.0)`, signature `(Float ...) -> Float`. discover picks the kind: Int when small integer arguments return an integer, Float when only small float arguments return a float. A numeric body without float literals (`hot-fsum`) is both, so it starts as Int and is promoted by **live type feedback**: the counting wrapper also stores its first argument in `sink-argf`, and `discover:retype!` turns a candidate whose live calls pass a float into Float. `fixture:float-workspace-code` is a second workspace (kept apart from the Int one, aura#4479); MVP step 5 runs discover -> type feedback -> identify -> generated double kernel -> closed loop there (~29-41x, bit-equal to Aura). Workspace Float candidates cannot use float literals yet (aura#4475: they read back as 0), so the literal case (`fpoly`) is checked against a host-file define.
 
 ### What runs for real vs stubbed
 

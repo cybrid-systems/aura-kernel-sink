@@ -59,6 +59,9 @@ Each has a minimal repro in `probes/`.
    "tree-walker fallback forbidden". The MVP therefore runs on the Soft face
    only. `std/ffi` additionally needs `effect:ffi` under a sandbox.
 
+- No `real?` predicate (unbound); `float?` / `integer?` exist. discover uses `float?` for the Float kind.
+- No per-call argument type feedback: the sink records the first argument of the last counted call itself (`sink-argf`, lib/counter.aura) to decide Int vs Float for polymorphic numeric defines. A native per-define arg-kind sample next to a call counter would replace it.
+
 ## Workarounds in this repo (remove when fixed upstream)
 
 - tests/mvp: plants are bound to a top-level define before the attempt (#4481).
@@ -68,6 +71,7 @@ Each has a minimal repro in `probes/`.
 | workaround | where | upstream |
 |---|---|---|
 | workspace constants are integers (`(>= (* 1000 ms-per-call) 50)`) | `lib/fixture.aura` | #4475 |
+| Float candidate `hot-fsum` has no float literal (`(- h h)` as 0.0, workload derives n as `(* h 200)`); literal Float kernel `fpoly` golden-checked against a host-file define | `lib/fixture.aura`, `tests/test_kgen_float.aura` | #4475 |
 | two `mutate:rebind` calls instead of one `mutate:atomic-batch` | `lib/loop.aura` (`loop:set-atomic-batch!`) | #4476 |
 | results stored with `set!`, not `(define x (attempt ...))` | `scripts/mvp.aura`, `tests/test_loop_*.aura` | #4476 |
 | test helper named `expect`, not `check` | `lib/expect.aura` | #4477 |

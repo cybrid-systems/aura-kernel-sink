@@ -13,9 +13,17 @@
 ;                   recursion is fine). A C kernel cannot call back into Aura,
 ;                   so drivers like app-workload are never candidates;
 ;                 * fixed arity (PARAMS is a list), 1..4 parameters;
-;               and one dynamic rule — Int-callable: calling it with small
-;               integers returns an integer (label-of returns strings; a body
-;               string literal rejects it before the probe).
+;               and one dynamic rule — the kernel kind:
+;                 Int    calling it with small integers returns an integer;
+;                 Float  otherwise, calling it with small floats returns a
+;                        float; kgen then emits a double kernel. A numeric
+;                        body without float literals (hot-fsum) is BOTH; it
+;                        is classified Int statically and becomes Float only
+;                        from live type feedback: discover:retype! after a
+;                        workload window, when the last live call passed a
+;                        float first argument (counter sink-argf);
+;                 #f     neither (label-of returns strings; a body string
+;                        literal rejects it before any probe).
 ;   3. instrument  every discovered define is hot-swapped into a counting
 ;               wrapper (lib/counter.aura, mutate:rebind); counter slots are
 ;               assigned in workspace order and recorded in a registry here.
@@ -43,6 +51,9 @@
         discover:probe
         discover:rows
         discover:max-candidates
+        discover:kind
+        discover:kinds
+        discover:retype!
         discover:print)
 
 (require "counter" all:)
@@ -169,6 +180,20 @@
   (let ((r (try (dc-apply (eval name) (dc-int-args arity)) (catch (e) "error"))))
     (integer? r)))
 
+(define (dc-float-args arity) (if (= arity 0) (list) (cons 3.0 (dc-float-args (- arity 1)))))
+
+; Float-callable: returns a float for small float arguments.
+(define (dc-float-callable? name arity)
+  (let ((r (try (dc-apply (eval name) (dc-float-args arity)) (catch (e) "error"))))
+    (float? r)))
+
+; "Int" | "Float" | #f
+(define (dc-kind name arity v)
+  (cond ((dc-has-strlit? v) #f)
+        ((dc-int-callable? name arity) "Int")
+        ((dc-float-callable? name arity) "Float")
+        (else #f)))
+
 (define (dc-leaf-candidate? name v names)
   (and (not (dc-prefix? "sink-" name))
        (dc-lambda? v)
@@ -176,7 +201,8 @@
        (<= (length (car (cdr v))) 4)
        (not (dc-mentions? (cdr (cdr v)) (dc-remove name names)))))
 
-; Candidate records (name arity numeric? lambda-src impl) from define records.
+; Candidate records (name arity numeric? lambda-src impl kind) from define
+; records. numeric? = kind is "Int" or "Float"; kind as in dc-kind.
 ;   impl = what a counting wrapper calls: sink-impl-NAME when the workspace
 ;   keeps the original body under that name, else the lambda source inline.
 (define (discover:candidates defs)
@@ -186,16 +212,44 @@
           (dc-rev acc)
           (let ((name (car (car ds))) (v (car (cdr (car ds)))))
             (if (dc-leaf-candidate? name v names)
-                (let ((arity (length (car (cdr v))))
-                      (src (dc-write v))
-                      (impl-name (string-append "sink-impl-" name)))
+                (let* ((arity (length (car (cdr v))))
+                       (src (dc-write v))
+                       (impl-name (string-append "sink-impl-" name))
+                       (kind (dc-kind name arity v)))
                   (loop (cdr ds)
                         (cons (list name arity
-                                    (and (not (dc-has-strlit? v)) (dc-int-callable? name arity))
+                                    (if kind #t #f)
                                     src
-                                    (if (dc-member? impl-name names) impl-name src))
+                                    (if (dc-member? impl-name names) impl-name src)
+                                    kind)
                               acc)))
                 (loop (cdr ds) acc)))))))
+
+; Kind of a candidate record ("Int" | "Float" | #f).
+(define (discover:kind r) (car (cdr (cdr (cdr (cdr (cdr r)))))))
+; (name kind) entries for kgen:emit!, from candidate records.
+(define (discover:kinds cands)
+  (if (null? cands) (list)
+      (cons (list (car (car cands)) (discover:kind (car cands))) (discover:kinds (cdr cands)))))
+
+(define (dc-with-kind r kind)
+  (list (car r) (car (cdr r)) (if kind #t #f) (car (cdr (cdr (cdr r)))) (car (cdr (cdr (cdr (cdr r))))) kind))
+
+; Live type feedback, after discover:observe: an Int candidate whose last live
+; call passed a float first argument, and which is Float-callable, becomes
+; Float. Updates the registry (probes follow) and returns the new records.
+(define (dc-retype r)
+  (let ((i (discover:index (car r))))
+    (if (and (>= i 0) (equal? (discover:kind r) "Int")
+             (float? (counter:last-arg i))
+             (dc-float-callable? (car r) (car (cdr r))))
+        (dc-with-kind r "Float")
+        r)))
+(define (dc-retype-all rs) (if (null? rs) (list) (cons (dc-retype (car rs)) (dc-retype-all (cdr rs)))))
+(define (discover:retype! cands)
+  (let ((new (dc-retype-all cands)))
+    (set! discover-registry (dc-retype-all discover-registry))
+    new))
 
 ; ---------------------------------------------------------------- registry
 (define discover-registry (list))  ; instrumented candidate records; slot = position
@@ -244,13 +298,19 @@
 
 ; Unary probe over the CURRENT workspace binding (resolved when built; build
 ; a fresh probe after every rebind). Extra parameters are fixed at 1.
+; Float candidates get float arguments: x as a float, extra parameters 0.5.
 (define (discover:probe name)
   (let ((p (eval name)) (r (discover-find name)))
     (let ((arity (if r (car (cdr r)) 1)))
-      (cond ((= arity 1) (lambda (x) (p x)))
-            ((= arity 2) (lambda (x) (p x 1)))
-            ((= arity 3) (lambda (x) (p x 1 1)))
-            (else (lambda (x) (p x 1 1 1)))))))
+      (if (and r (equal? (discover:kind r) "Float"))
+          (cond ((= arity 1) (lambda (x) (p (+ 0.0 x))))
+                ((= arity 2) (lambda (x) (p (+ 0.0 x) 0.5)))
+                ((= arity 3) (lambda (x) (p (+ 0.0 x) 0.5 0.5)))
+                (else (lambda (x) (p (+ 0.0 x) 0.5 0.5 0.5))))
+          (cond ((= arity 1) (lambda (x) (p x)))
+                ((= arity 2) (lambda (x) (p x 1)))
+                ((= arity 3) (lambda (x) (p x 1 1)))
+                (else (lambda (x) (p x 1 1 1))))))))
 
 ; Repetitions so one measurement of (probe arg) takes >= 10 ms.
 (define (dc-calibrate probe arg)
@@ -280,6 +340,7 @@
       #t
       (let ((r (car cands)))
         (display "  ") (display (car r)) (display "  arity=") (display (car (cdr r)))
-        (display "  int-callable=") (display (car (cdr (cdr r))))
+        (display "  int-callable=") (display (equal? (discover:kind r) "Int"))
+        (display "  kind=") (display (discover:kind r))
         (display "  slot=") (display (discover:index (car r))) (newline)
         (discover:print (cdr cands)))))

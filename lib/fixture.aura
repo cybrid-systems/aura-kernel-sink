@@ -18,6 +18,10 @@
 ; static call sites come from (query:calls name).
 
 (export fixture:workspace-code
+        fixture:float-workspace-code
+        fixture:float-literal-src
+        fixture:kind
+        fixture:float-candidates
         fixture:aura-body
         fixture:candidates
         fixture:probe
@@ -41,6 +45,12 @@
     ((string=? name "hot-sum-sq")
      "(lambda (n) (let loop ((i 0) (s 0)) (if (< i n) (loop (+ i 1) (+ s (* i i))) s)))")
     ((string=? name "cold-add") "(lambda (a b) (+ a b))")
+    ; Float candidate: no float literal in the body, because float literals
+    ; inside workspace procedure bodies read back as 0 on the pinned tip
+    ; (aura#4475). Called with float n / h it returns a float; the generated
+    ; kernel is double throughout (integer literals become doubles).
+    ((string=? name "hot-fsum")
+     "(lambda (n h) (let loop ((i 0) (s (- h h))) (if (< i n) (loop (+ i 1) (+ s (* h i i))) s)))")
     ((string=? name "label-of") "(lambda (n) (if (> n 0) \"pos\" \"non-pos\"))")
     (else "")))
 
@@ -76,6 +86,30 @@
    ; Per round: hot-sum-sq x1 (if hot?), cold-add x12, label-of x1.
    "(define (app-workload rounds hot?) (if (> rounds 0) (begin (if hot? (hot-sum-sq 100) 0) (let adds ((k 12) (acc 0)) (if (> k 0) (adds (- k 1) (cold-add acc k)) acc)) (label-of rounds) (app-workload (- rounds 1) hot?)) 0))\n"))
 
+; Float workspace: one Float candidate (hot-fsum), one Int (cold-add), one
+; neither (label-of), same control plane. Kept separate from the Int workspace
+; so neither crosses 8 procedure defines (aura#4479). The workload takes the
+; float h as a parameter (no float literal in a workspace body, aura#4475).
+(define (fixture:float-workspace-code)
+  (string-append
+   "(define sink-kernel-hot-fsum 0)\n"
+   "(define hot-fsum " (fixture:aura-body "hot-fsum") ")\n"
+   "(define cold-add " (fixture:aura-body "cold-add") ")\n"
+   "(define label-of " (fixture:aura-body "label-of") ")\n"
+   (fixture:policy-define 50 50)
+   "(define (sink-min-speedup) 2)\n"
+   (counter:workspace-code (discover:max-candidates))
+   "(define sink-impl-hot-fsum " (fixture:aura-body "hot-fsum") ")\n"
+   "(define (app-workload-f rounds h) (if (> rounds 0) (begin (hot-fsum (* h 200) h) (cold-add rounds 1) (label-of rounds) (app-workload-f (- rounds 1) h)) 0))\n"))
+
+; A Float define WITH float literals, used outside the workspace (the golden
+; reference is a host-file define, where literals evaluate correctly).
+(define (fixture:float-literal-src)
+  "(define fpoly (lambda (x) (+ (* 1.5 x x) (* 0.25 x) -2.0)))")
+
+; c-func scalar kind of a fixture candidate.
+(define (fixture:kind name) (if (string=? name "hot-fsum") "Float" "Int"))
+
 ; Counter slot of each candidate in sink-calls.
 (define (fixture:index name)
   (cond ((>= (discover:index name) 0) (discover:index name))
@@ -84,7 +118,7 @@
         ((string=? name "label-of") 2)
         (else -1)))
 
-(define (fixture-arity name) (if (string=? name "cold-add") 2 1))
+(define (fixture-arity name) (if (or (string=? name "cold-add") (string=? name "hot-fsum")) 2 1))
 
 ; The instrumented (counting) Aura body: the rollback target of a sink.
 (define (fixture:counted-body name)
@@ -118,6 +152,11 @@
         (list "cold-add" 2 #t 1 7 2000)
         (list "label-of" 1 #f 2 5 2000)))
 
+; Float workspace rows (same shape); kept apart so Int-workspace callers of
+; fixture:candidates never probe hot-fsum, which only exists there.
+(define (fixture:float-candidates)
+  (list (list "hot-fsum" 2 #t 0 5000 60)))
+
 ; Unary probes. Each looks the workspace name up at call time, so after a
 ; mutate:rebind the probe calls the new binding.
 (define (fixture:probe name)
@@ -125,6 +164,7 @@
     ((string=? name "hot-sum-sq") (lambda (x) (hot-sum-sq x)))
     ((string=? name "cold-add") (lambda (x) (cold-add x 1)))
     ((string=? name "label-of") (lambda (x) (label-of x)))
+    ((string=? name "hot-fsum") (lambda (x) (hot-fsum (+ 0.0 x) 0.5)))
     (else (lambda (x) x))))
 
 ; Correctness cases (results stay well inside the fixnum range).
@@ -132,6 +172,7 @@
   (cond
     ((string=? name "hot-sum-sq") (list 0 1 2 3 10 100 1000 4999 20000))
     ((string=? name "cold-add") (list -5 0 1 41 1000000))
+    ((string=? name "hot-fsum") (list 0 1 2 3 10 100 1000 4999))
     (else (list 0 1 5))))
 
 ; Repo root: SINK_ROOT if set, else the current directory (scripts cd there).
@@ -149,6 +190,7 @@
 (define (fixture-fake name variant)
   (cond
     ((string=? name "cold-add") "(lambda (a b) (+ b a))")
+    ((string=? name "hot-fsum") "(lambda (n h) (if (< n 1) (- h h) (* h (/ (* n (- n 1) (- (* 2 n) 1)) 6))))")
     ((string=? variant "good") "(lambda (n) (if (< n 1) 0 (quotient (* n (- n 1) (- (* 2 n) 1)) 6)))")
     ((string=? variant "wrong") "(lambda (n) (if (< n 1) 1 (+ 1 (quotient (* n (- n 1) (- (* 2 n) 1)) 6))))")
     ((string=? variant "slow")
@@ -174,8 +216,8 @@
 (define (fixture-plan-raw name variant)
   (cond
     ((string=? variant "generated")
-     (sink-plan:make name (fixture:so (kgen:base name)) (kgen:symbol name) (fixture-arity name)
-                     (fixture:aura-body name) (fixture-fake name "good")))
+     (sink-plan:make-kind name (fixture:so (kgen:base name)) (kgen:symbol name) (fixture-arity name)
+                          (fixture:aura-body name) (fixture-fake name "good") (fixture:kind name)))
     ((string=? name "cold-add")
      (sink-plan:make "cold-add" (fixture:so "example_add") "sink_add" 2
                      (fixture:aura-body "cold-add") (fixture-fake "cold-add" "good")))
