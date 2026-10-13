@@ -61,7 +61,7 @@
 (expect "golden sub: edges in range == Aura" (and (same2 ksub ov-sub fmax 1) (same2 ksub ov-sub 0 4503599627370495) (same2 ksub ov-sub -5 9)))
 (expect "golden mul: edges in range == Aura" (and (same2 kmul ov-mul 2147483648 1073741824) (same2 kmul ov-mul fmax 1) (same2 kmul ov-mul -3 7) (same2 kmul ov-mul -2 2251799813685248)))
 (expect "golden neg: == Aura" (and (same1 kneg ov-neg 4503599627370496) (same1 kneg ov-neg nedge) (same1 kneg ov-neg 0)))
-(expect "neg of 2^62-1: in fixnum, refused by the return guard" (ovf1 kneg fmax))
+(expect "neg of 2^62-1: in fixnum, returned exactly (aura#4482)" (let ((r ((k-f kneg) fmax))) (and (= ((k-o kneg)) 0) (= r (- 0 fmax)))))
 (expect "golden chain (+ c c 2): in range == Aura" (and (same1 kchain ov-chain 1000) (same1 kchain ov-chain (- half 1))))
 (expect "golden pow loop: 3^39, 2^61, (-2)^51 == Aura" (and (same2 kpow ov-pow 3 39) (same2 kpow ov-pow 2 61) (same2 kpow ov-pow -2 51)))
 
@@ -75,8 +75,7 @@
 (expect "overflow chain: (+ c c 2) at c=2^61-1 (aura#4462 shape) -> fail closed" (ovf1 kchain half))
 (expect "overflow pow loop: 2^62 stops the loop -> fail closed" (ovf2 kpow 2 62))
 (expect "overflow pow loop: 3^1000000 stops at the first overflow (no runaway)" (ovf2 kpow 3 1000000))
-(expect "return guard: result -(2^62-1) (in fixnum, but the pinned Aura reads it back corrupt) -> fail closed" (ovf2 ksub 0 fmax))
-(expect "return guard: -5*10^15 result -> fail closed, -4999999999999999 passes (== Aura)" (and (ovf2 ksub 0 5000000000000000) (ovf2 ksub 0 9007199254740992) (same2 ksub ov-sub 0 4999999999999999)))
+(expect "large negatives: -(2^62-1), -5*10^15, -2^53 come back exact (== Aura, aura#4482)" (and (same2 ksub ov-sub 0 fmax) (same2 ksub ov-sub 0 5000000000000000) (same2 ksub ov-sub 0 9007199254740992) (same2 ksub ov-sub 0 4999999999999999)))
 (expect "chain (+ c c 2) at c=-3 == Aura (small negatives pass the return guard)" (same1 kchain ov-chain -3))
 (expect "status is per call: next in-range call is clean" (same2 kadd ov-add 1 2))
 

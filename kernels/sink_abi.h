@@ -70,6 +70,9 @@ static inline int64_t sink_ck_quo(int64_t a, int64_t b, int *ovf) {
  * INT64_MIN % -1, UB in C, never runs; Soft also returns 0 for -2^62 % -1).
  * An operand outside the fixnum range (only reachable from a non-Aura
  * caller) sets the overflow bit (1). |r| < |b|, so results stay in range. */
+/* aura#4486 is fixed upstream (36bc90f): Aura modulo is R7RS floor modulo, so
+ * floor is the default. -DAURA_SINK_MODULO_FLOOR=0 restores the old
+ * non-negative behaviour for pre-fix Aura builds. */
 #ifndef AURA_SINK_MODULO_FLOOR
 #define AURA_SINK_MODULO_FLOOR 1
 #endif
@@ -95,14 +98,13 @@ static inline int64_t sink_ck_mod(int64_t a, int64_t b, int *ovf) {
   return r;
 }
 
-/* Return guard. The pinned Aura tip cannot take a negative Int at or below
- * -5*10^15 back across c-func (observed boundary: -4999999999999999 works,
- * -5000000000000000 comes back corrupt; Aura literals and arithmetic there
- * turn Float, see IMPROVEMENTS.md). Kernel RESULTS < AURA_SINK_RET_MIN
- * therefore fail closed like an overflow; intermediates use the full fixnum
- * range. Build with -DAURA_SINK_RET_MIN=AURA_SINK_FIX_MIN once Aura is fixed. */
+/* Return guard. Since aura#4482 (value ABI 2) Aura fixnums are the symmetric
+ * [-2^62, 2^62-1], so every in-range kernel result crosses c-func as an exact
+ * Int. The guard is just the overflow flag; AURA_SINK_RET_MIN stays as an
+ * override hook and defaults to the fixnum minimum. */
+#define AURA_SINK_VALUE_ABI 2 /* requires Aura value-encoding ABI >= 2 (aura#4482) */
 #ifndef AURA_SINK_RET_MIN
-#define AURA_SINK_RET_MIN INT64_C(-4999999999999999)
+#define AURA_SINK_RET_MIN AURA_SINK_FIX_MIN
 #endif
 static inline int sink_ck_ret(int64_t r, int ovf) { return ovf || r < AURA_SINK_RET_MIN; }
 

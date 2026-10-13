@@ -5,8 +5,7 @@
 ;; with status bit 2, and the sink wrapper raises
 ;; (error "sink: int overflow/div0 in <name> ..."), i.e. fail closed with an
 ;; Aura error on both sides. -2^62 / -1 = 2^62 leaves the fixnum range: status
-;; bit 1 (overflow). Soft cannot be the reference there (-2^62 is not usable
-;; from Aura on the pinned tip, aura#4482), so no Aura value is compared.
+;; bit 1 (overflow). -2^62 itself is an exact Aura Int since aura#4482.
 (require "expect" all:)
 (require "fixture" all:)
 (require "kgen" all:)
@@ -58,7 +57,7 @@
 (expect "div0 /: fail closed, status=2" (st2 kdiv -7 0 2))
 (expect "div0 in loop: first iteration stops the loop (no spin)" (st2 kqloop 12345 0 2))
 (expect "MIN/-1: -2^62 / -1 = 2^62 -> overflow, status=1" (st1 kqmin -1 1))
-(expect "-2^62 / 1: in fixnum, refused by the return guard (aura#4482)" (st1 kqmin 1 1))
+(expect "-2^62 / 1: in fixnum, returned exactly (aura#4482 fixed)" (let ((r ((k-f kqmin) 1))) (and (= ((k-o kqmin)) 0) (integer? r) (= r -4611686018427387904))))
 (expect "status per call: next in-range call clean" (same2 kquo ov-quo 9 3))
 
 ; through the checked slot body: Aura error naming div0
