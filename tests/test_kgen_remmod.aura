@@ -1,9 +1,8 @@
 ;; tests/test_kgen_remmod.aura — checked Int remainder / modulo in generated kernels.
 ;; In range: kernel == Aura Soft for every sign combination.
 ;;   remainder: truncating, sign of the dividend (C99 %).
-;;   modulo: the pinned Soft returns a NON-NEGATIVE result (r<0 -> r+|b|),
-;;   e.g. (modulo 7 -2) = 1 where R7RS floor modulo gives -1 (aura#4486). The
-;;   kernel matches Soft (AURA_SINK_MODULO_FLOOR=0 default).
+;;   modulo: R7RS floor modulo, sign of the divisor, e.g. (modulo 7 -2) = -1
+;;   (Soft since aura#4486; kernel AURA_SINK_MODULO_FLOOR=1 default).
 ;; Div by zero: Soft raises a catchable error; the kernel never executes %,
 ;; returns 0 with status bit 2 and the wrapper raises an Aura error.
 ;; b == -1: always 0 on both sides (Soft returns 0 for -2^62 % -1 too); the
@@ -53,8 +52,8 @@
 (expect "golden remainder: all sign combos == Aura" (all-signs krem ov-rem))
 (expect "golden modulo: all sign combos == Aura" (all-signs kmod ov-mod))
 (expect "remainder sign follows the dividend" (and (= ((k-f krem) -7 2) -1) (= ((k-f krem) 7 -2) 1)))
-(expect "modulo on the pinned Soft is non-negative (kernel matches; aura#4486)"
-        (and (= (ov-mod 7 -2) 1) (= ((k-f kmod) 7 -2) 1) (= (ov-mod -7 -2) 1) (= ((k-f kmod) -7 -2) 1) (= ((k-f kmod) -7 2) 1)))
+(expect "modulo is floor modulo, sign of the divisor (Soft and kernel; aura#4486)"
+        (and (= (ov-mod 7 -2) -1) (= ((k-f kmod) 7 -2) -1) (= (ov-mod -7 -2) -1) (= ((k-f kmod) -7 -2) -1) (= ((k-f kmod) -7 2) 1)))
 (expect "golden remainder edges == Aura"
         (and (same2 krem ov-rem fmax 2) (same2 krem ov-rem fmax -7) (same2 krem ov-rem fmax fmax) (same2 krem ov-rem nedge 7) (same2 krem ov-rem nedge -1) (same2 krem ov-rem 3 fmax) (same2 krem ov-rem fmax -1)))
 (expect "golden modulo edges == Aura"

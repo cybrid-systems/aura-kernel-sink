@@ -62,18 +62,16 @@ static inline int64_t sink_ck_quo(int64_t a, int64_t b, int *ovf) {
 
 /* Remainder / modulo (aura Soft `remainder` / `modulo` on Int).
  * remainder: truncating, sign of the dividend (C99 `%`): (remainder -7 2) = -1.
- * modulo: what the pinned Aura Soft actually computes is r = a % b; if (r < 0)
- * r += |b| -- a NON-NEGATIVE (Euclidean) result, so (modulo 7 -2) = 1, not the
- * R7RS floor modulo -1 (see IMPROVEMENTS.md). The kernel matches Soft
- * bit-for-bit; build with -DAURA_SINK_MODULO_FLOOR=1 for R7RS floor
- * semantics (sign of the divisor) once Aura is fixed.
+ * modulo: R7RS floor modulo, sign of the divisor: (modulo 7 -2) = -1. Aura
+ * Soft computes this since aura#4486 was fixed (older tips returned a
+ * non-negative r + |b|; build with -DAURA_SINK_MODULO_FLOOR=0 to match one).
  * Divisor checked BEFORE `%`: b == 0 sets the div0 bit (2) and returns 0 with
  * no `%` executed. b == -1: the result is always 0 (no `%` executed, so
  * INT64_MIN % -1, UB in C, never runs; Soft also returns 0 for -2^62 % -1).
  * An operand outside the fixnum range (only reachable from a non-Aura
  * caller) sets the overflow bit (1). |r| < |b|, so results stay in range. */
 #ifndef AURA_SINK_MODULO_FLOOR
-#define AURA_SINK_MODULO_FLOOR 0
+#define AURA_SINK_MODULO_FLOOR 1
 #endif
 static inline int sink_div_pre_(int64_t a, int64_t b, int *ovf) {
   if (b == 0) { *ovf |= 2; return 0; }

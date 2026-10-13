@@ -321,19 +321,13 @@
 
 ; identify rows (name arity numeric? index bench-arg bench-reps).
 ; Non-numeric candidates are not probed with bench-arg (reps 1).
-; Plain recursion, no map / no lambda argument: on the pinned tip `map`
-; corrupts earlier results when the mapped procedure calls another procedure
-; (aura#4480), and a hand-written map taking a lambda
-; failed with "invalid closure" here.
 (define (dc-row r bench-arg)
   (let ((name (car r)) (numeric (car (cdr (cdr r)))))
     (list name (car (cdr r)) numeric (discover:index name) bench-arg
           (if numeric (dc-calibrate (discover:probe name) bench-arg) 1))))
 
 (define (discover:rows cands bench-arg)
-  (if (null? cands)
-      (list)
-      (cons (dc-row (car cands) bench-arg) (discover:rows (cdr cands) bench-arg))))
+  (map (lambda (r) (dc-row r bench-arg)) cands))
 
 (define (discover:print cands)
   (if (null? cands)

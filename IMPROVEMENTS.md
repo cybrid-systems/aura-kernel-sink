@@ -17,8 +17,8 @@ Each has a minimal repro in `probes/`.
 - #4482 negative Int at or below about -5·10^15 is Float (literals, arithmetic results) and comes back corrupt from a `c-func ... -> Int` (prints `0`/`<unknown>`, `integer?` is #f, `=` raises `expected Int, got String ''`); the positive side is fine up to 2^62-1. Hit by `tests/test_kgen_overflow.aura`; generated Int kernels fail closed on results < -4999999999999999 (`AURA_SINK_RET_MIN`) until it is fixed.
 - #4483 a `c-func ... -> Int` returning a long outside the fixnum range aborts the process (SIGABRT, `try` cannot catch it). This is why overflow is signalled through a separate `<symbol>_overflowed` status, not an out-of-range sentinel.
 - #4485 `string->number` on integer strings goes through double: it rounds above 2^53 (`"9007199254740993"` → ...992) and SIGABRTs, uncatchable, at `"4611686018427387903"`. It crashed kernel generation on a define containing 2^62-1. Workaround: `kg-int-literal?` recognises integer literals by their characters (≤ 2^62-1) and emits them verbatim.
-- #4486 `modulo` with a negative divisor returns a non-negative (Euclidean) result: `(modulo 7 -2)` = 1, `(modulo -7 -2)` = 1, `(modulo 9 -4)` = 1, where floor modulo (the primitive's own docstring, and R7RS) gives -1, -1, -3. Cause: `r = n % d; if (r < 0) r += |d|` in `evaluator_primitives_math.cpp`. Hit by `tests/test_kgen_remmod.aura`; generated kernels reproduce Soft's result (`AURA_SINK_MODULO_FLOOR=0`) so a sunk define never changes answers; flip the macro when #4486 is fixed.
-- #4480 `map` corrupts earlier results when the mapped procedure calls another procedure (regression in b13af9334..94ca96362, still on d89d39c56). Workaround: lib/discover.aura builds rows with plain recursion.
+- #4486 FIXED upstream (re-pin 72b452f75): `modulo` is floor modulo; kernels default to `AURA_SINK_MODULO_FLOOR=1`. Was: `modulo` with a negative divisor returns a non-negative (Euclidean) result: `(modulo 7 -2)` = 1, `(modulo -7 -2)` = 1, `(modulo 9 -4)` = 1, where floor modulo (the primitive's own docstring, and R7RS) gives -1, -1, -3. Cause: `r = n % d; if (r < 0) r += |d|` in `evaluator_primitives_math.cpp`. Hit by `tests/test_kgen_remmod.aura`; generated kernels reproduce Soft's result (`AURA_SINK_MODULO_FLOOR=0`) so a sunk define never changes answers; flip the macro when #4486 is fixed.
+- #4480 FIXED upstream (re-pin 72b452f75): lib/discover.aura builds rows with `map` again. Was: `map` corrupts earlier results when the mapped procedure calls another procedure (regression in b13af9334..94ca96362, still on d89d39c56). Workaround: lib/discover.aura builds rows with plain recursion.
 
 ## Aura API gaps (not filed as bugs)
 
@@ -70,7 +70,7 @@ Each has a minimal repro in `probes/`.
 
 - tests/mvp: plants are bound to a top-level define before the attempt (#4481).
 - kgen: no `map`, results threaded as `(ok? value)` lists (#4480).
-- discover: no `map` with calling procedures (#4480); calibration calls `(eval name)` directly, not via a probe closure.
+- discover: ~~no `map` with calling procedures (#4480)~~ uses `map` since the re-pin; calibration calls `(eval name)` directly, not via a probe closure.
 
 | workaround | where | upstream |
 |---|---|---|
