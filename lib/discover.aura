@@ -40,6 +40,7 @@
 ; candidates beyond that are discovered but not instrumented.
 
 (export discover:read
+        discover:write
         discover:scan
         discover:defines
         discover:candidates
@@ -121,6 +122,8 @@
         (if (null? xs)
             (string-append acc ")")
             (loop (cdr xs) (string-append acc (if first "" " ") (dc-write (car xs))) #f)))))
+
+(define (discover:write t) (dc-write t))
 
 ; ---------------------------------------------------------------- scan
 ; Top-level forms of the workspace. (query:code) wraps several defines in

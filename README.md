@@ -119,6 +119,21 @@ checks: 8 passed, 0 failed
 
 测试 `tests/test_bg.aura`（28 项）：后台构建、门控接受、错一位 kernel 在门口被拒（generation 不变）、编辑检测 + 重沉、不支持的编辑保持 Soft、缓存命中、fiber 构建 + vdot 门控下沉。
 
+### 画像驱动的下沉策略 + KEEP/ROLLBACK 轨迹（`lib/policy.aura`）
+
+`policy:sink!` 对一个 workspace define 做一次决策，并往轨迹文件追加一行 JSON（给 aura-loop 或离线分析用）：
+
+1. **profile**：先实测 Soft define 每次调用的耗时，低于 `min-soft-us` 就 `SKIP`，不编译（FFI + 守卫本身要 40–60 µs/次，收益会被吃掉）。
+2. **compile**：vkgen + 后台 cc。不支持或构建失败就 `SKIP` 并带原因。
+3. **gate**：影子比对没过就 `ABORT`，不产生任何 mutation。
+4. **score**：一次 atomic batch 之后实测加速比。达到阈值就 `KEEP`，并登记到 `watch`；没达到就 `ROLLBACK`（heal 回 Soft）。
+
+阈值可以直接传参，传 `#f` 时读 workspace 的 `(sink-min-speedup)`，所以外层循环可以用 `mutate:rebind` 热换策略。每行字段：`ts name decision stage reasons kinds so threshold speedup soft_us_per_call t_before_ms t_after_ms reps bench_arg gen_before gen_after rolled_back rollback_ok`。`policy:read` 用 `json-parse` 读回，`policy:summary` 统计 KEEP/ROLLBACK/ABORT/SKIP 各几行。
+
+`scripts/policy.aura` 对所有 f64vector fixture 跑一遍，轨迹写到 `build/trajectory.jsonl`（`SINK_MIN_SPEEDUP`、`SINK_MIN_SOFT_US`、`SINK_TRAJECTORY` 可调）。阈值 2：KEEP 6、SKIP 1（vbad-mix），闭环实测加速 6.4×–14×（5000 元素，含 wrapper 开销）。阈值 10：vsum、vdot、vcount-above 被 ROLLBACK，vnorm2、vscaled、vmaxabs 保留。测试 `tests/test_policy.aura`（15 项）。
+
+计时：`score:set-rounds!` 取多轮中最好的一轮，向量测试和策略用 3 轮。共享机器上毫秒级计时有抖动，单轮时偶尔会把 accept 翻成 too-slow。
+
 ### 值编码 ABI（单一来源）
 
 `kernels/sink_abi.h` 不再自己写编码常量，而是直接包含 Aura 的 `lib/aura_value_abi.h`（aura#4502，ABI 4）：`kernels/build.sh` 加 `-I$AURA_LIB`，该头文件变化时重编所有 kernel；fixnum 范围取自 `AURA_FIXNUM_MIN/MAX`，低于 ABI 4 直接 `#error`。每个 kernel 导出 `aura_sink_value_abi()`，`plant:real` 在 `c-load` 后、任何 mutation 之前检查它，不匹配就在 load 阶段拒绝（`kernels/stale_abi.c` 对应测试）。
@@ -241,6 +256,21 @@ The gap between sunk and raw c-func is the wrapper's guards plus the full copy o
 - **Dirty-tracking re-sink**: `watch:register!` records a sunk define's wrapper and sample args. `watch:check` first compares `ast:generation`: if unchanged, the define is clean (fast path). Otherwise it compares trees from `discover:scan` and returns `clean/edited/removed` plus the new tree. When the user edits a sunk define (`mutate:rebind`), the new body is live at once on Soft and `watch:check` reports `edited`. The background job then rebuilds from the new tree and swaps it in through the gate. An edit to an unsupported body stays Soft with job status `skipped` (e.g. `unsupported call exp`). An edit back to an earlier body is a cache hit (`cached`, same .so).
 
 Test `tests/test_bg.aura` (28 checks) covers: background build, gated accept, an off-by-one kernel rejected at the gate (generation unchanged), edit detection + re-sink, an unsupported edit staying Soft, a cache hit, and a fiber build + gated vdot sink.
+
+### Profile-guided sink policy + KEEP/ROLLBACK trajectories (`lib/policy.aura`)
+
+`policy:sink!` makes one decision for one workspace define and appends one JSON line to a trajectory file (for aura-loop or offline analysis):
+
+1. **profile**: measure the Soft define's cost per call. Below `min-soft-us` it is a `SKIP` and nothing is compiled, because the FFI + guard overhead (40–60 µs per call) would eat the gain.
+2. **compile**: vkgen + background cc. An unsupported body or a failed build is a `SKIP` with the reason.
+3. **gate**: a shadow mismatch is an `ABORT`, with no mutation at all.
+4. **score**: one atomic batch, then the measured speedup. At or above the threshold it is a `KEEP` and the define is registered with `watch`; below it, a `ROLLBACK` (heal back to Soft).
+
+The threshold is passed in. With `#f` it is read from the workspace policy define `(sink-min-speedup)`, so an outer loop can hot-swap it with `mutate:rebind`. Row fields: `ts name decision stage reasons kinds so threshold speedup soft_us_per_call t_before_ms t_after_ms reps bench_arg gen_before gen_after rolled_back rollback_ok`. `policy:read` reads the file back with `json-parse`, and `policy:summary` counts KEEP/ROLLBACK/ABORT/SKIP.
+
+`scripts/policy.aura` runs the policy over every f64vector fixture and writes `build/trajectory.jsonl` (tunable with `SINK_MIN_SPEEDUP`, `SINK_MIN_SOFT_US` and `SINK_TRAJECTORY`). At threshold 2 the result is KEEP 6 and SKIP 1 (vbad-mix), with closed-loop speedups of 6.4×–14× (5000 elements, wrapper overhead included). At threshold 10, vsum, vdot and vcount-above are ROLLBACK, while vnorm2, vscaled and vmaxabs are kept. Test: `tests/test_policy.aura` (15 checks).
+
+Timing: `score:set-rounds!` takes the best of several timed rounds; the vector tests and the policy use 3. On a shared box a single ms-timer round occasionally flipped an accept to too-slow.
 
 ### Value ABI (single source)
 

@@ -1,0 +1,45 @@
+; scripts/policy.aura — run the profile-guided sink policy over every
+; f64vector fixture define and write a KEEP/ROLLBACK/ABORT/SKIP trajectory
+; (one JSON object per line) to $SINK_TRAJECTORY or build/trajectory.jsonl.
+; Threshold: the workspace (sink-min-speedup), overridable with
+; $SINK_MIN_SPEEDUP; Soft floor: $SINK_MIN_SOFT_US (default 50 us/call).
+;   source scripts/env.sh; $AURA_BIN scripts/policy.aura
+(require "fixture" all:)
+(require "plant" all:)
+(require "score" all:)
+(require "policy" all:)
+(require "std/ffi" all:)
+(require "std/process" all:)
+(require "std/hot-strategy" all:)
+
+(score:set-rounds! 3)  ; best of 3 timed rounds (shared box, ms timer)
+(define (env-or k d) (let ((v (getenv k))) (if (and (string? v) (> (string-length v) 0)) v d)))
+(define traj (env-or "SINK_TRAJECTORY" "build/trajectory.jsonl"))
+(define thr (let ((v (getenv "SINK_MIN_SPEEDUP"))) (if (and (string? v) (> (string-length v) 0)) (string->number v) #f)))
+(define floor-us (string->number (env-or "SINK_MIN_SOFT_US" "50")))
+(define plant (plant:real))
+(set-code (fixture:vector-workspace-code))
+(eval-current)
+
+(define (mkvec n seed)
+  (let ((v (make-f64vector n)))
+    (let loop ((i 0))
+      (if (< i n) (begin (f64vector-set! v i (- (* 0.1 (modulo (+ (* i 7919) seed) 1000)) 50.3)) (loop (+ i 1))) v))))
+(define va (mkvec 5000 17))
+(define vb (mkvec 5000 4242))
+(define vs (mkvec 10 3))
+(define cases (list 0 1 2 7 49 333 999 5000))
+
+(define (run! name samples probe shadow)
+  (policy:print (policy:sink! plant name samples probe cases shadow 5000 10 floor-us thr traj)))
+(run! "vsum" (list va 5000) (lambda (k) (vsum va k)) (list (list va 0) (list va 5000) (list vs 10)))
+(run! "vdot" (list va vb 5000) (lambda (k) (vdot va vb k)) (list (list va vb 0) (list va vb 5000) (list vs vb 10)))
+(run! "vnorm2" (list va) (lambda (k) (vnorm2 va)) (list (list va) (list vs)))
+(run! "vscaled" (list va 0.5) (lambda (k) (vscaled va 0.5)) (list (list va 0.5) (list vs 2.5)))
+(run! "vcount-above" (list va 0.5) (lambda (k) (vcount-above va 0.5)) (list (list va 0.5) (list vs -1.0)))
+(run! "vmaxabs" (list va) (lambda (k) (vmaxabs va)) (list (list va) (list vs)))
+(run! "vbad-mix" (list va) (lambda (k) (vbad-mix va)) (list (list va)))
+(define s (policy:summary traj))
+(display (string-append "trajectory " traj ": KEEP " (number->string (car s)) " ROLLBACK " (number->string (car (cdr s)))
+                        " ABORT " (number->string (car (cdr (cdr s)))) " SKIP " (number->string (car (cdr (cdr (cdr s)))))))
+(newline)

@@ -16,11 +16,13 @@
 (require "watch" all:)
 (require "sink_plan" all:)
 (require "plant" all:)
+(require "score" all:)
 (require "loop" all:)
 (require "std/ffi" all:)
 (require "std/fs" all:)
 (require "std/process" all:)
 (require "std/hot-strategy" all:)
+(score:set-rounds! 3)  ; best of 3 timed rounds (shared box, ms timer)
 (display "RUN-ONCE") (newline)
 
 (define plant (plant:real))

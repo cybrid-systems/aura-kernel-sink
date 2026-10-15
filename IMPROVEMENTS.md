@@ -28,6 +28,8 @@ Each has a minimal repro in `probes/`.
 - Re-checked on `542fb9254`: #4475 (float literals in workspace bodies), #4476 (atomic-batch re-run / unbound define), #4477 (primitive shadow) and #4479 (9+ procs slow) are fixed. The f64vector fixtures use float literals in workspace bodies directly.
 - Not filed (no minimal repro yet): after one accepted sink, the 3-arg wrapper `(lambda (a0 a1 a2) (sink-kernel-vdot a0 a1 a2))` of a second sink costs about 0.44 ms per call, while calling its slot directly costs 0.09 ms. Sinking vdot first has no gap, and a pure-Aura version with the same shape doesn't reproduce it. The vector tests use 5000-element bench vectors, so the kernel dominates either way.
 - [#4535](https://github.com/cybrid-systems/aura/issues/4535) (new): an error caught by `try`/`catch` inside a define evaluated through `set-code`/`eval-current` is still printed to stderr, twice, as `type mismatch — expected Int, got Error`, even for a Float add. The same code at top level prints nothing. Hit by the shadow gate in `tests/test_bg.aura`: an out-of-bounds probe on Soft made `run_tests.sh` fail on the `error:` line. Workaround: the bg test has no out-of-bounds shadow probe; bounds are covered in `tests/test_vkgen.aura`.
+- [#4537](https://github.com/cybrid-systems/aura/issues/4537) (new): a host list that is referenced only from a caller's frame is corrupted after about 100 calls to an `eval-current` workspace define, silently and with rc=0. It comes back shortened, as `(())`, or as a self-nested cycle. A host-defined copy of the same function, or a list bound to a top-level define, is unaffected. In `scripts/policy.aura` with reps=20, `(list va 5000)` became a 1-element list (kind inference failed), and the golden list of `loop:sink-gated` ended up containing unrelated pairs (`expected Int, got Void` in the check, so wrong-result → ROLLBACK: the loop failed closed, never accepted a wrong kernel). Workarounds: `policy:sink!`, `loop:sink-gated` and `loop:sink-one` pin their frame lists in a module global; the policy profile is one short round, and the build wait sleeps instead of serving Soft calls. This keeps the workspace-call window small. Drop the workaround when it is fixed.
+- #4532 again: after the six sinks in `scripts/policy.aura`, std `string-split` returned `0`. `lib/policy.aura` has its own line splitter.
 - Not filed (known, aura#2738): on the thread backend fibers are serialized with the main evaluator. A fiber running `shell "sleep 1"` let main make no progress (main spun 70 iterations, fiber 1918 ms). `lib/bg.aura` therefore gets its parallelism from a detached cc process and uses fibers only as a join handle.
 - `score:bench` now runs an untimed warm-up (reps/4 + 1 calls) on both sides.
 
@@ -89,6 +91,8 @@ Each has a minimal repro in `probes/`.
 | Float candidate `hot-fsum` has no float literal (`(- h h)` as 0.0, workload derives n as `(* h 200)`); literal Float kernel `fpoly` golden-checked against a host-file define | `lib/fixture.aura`, `tests/test_kgen_float.aura` | #4475 |
 | ~~two `mutate:rebind` calls instead of one `mutate:atomic-batch`~~ removed: atomic batch on by default | `lib/loop.aura` | #4476 fixed |
 | no out-of-bounds shadow probe in the bg test | `tests/test_bg.aura` | #4535 |
+| frame lists pinned in module globals; small profile; build wait sleeps | `lib/policy.aura`, `lib/loop.aura` | #4537 |
+| own line splitter instead of `string-split` | `lib/policy.aura` | #4532 |
 | vector tests split into separate processes; no std closures after sinks | `tests/test_vkgen*.aura`, `tests/test_bg.aura` | #4532 |
 | results stored with `set!`, not `(define x (attempt ...))` | `scripts/mvp.aura`, `tests/test_loop_*.aura` | #4476 |
 | test helper named `expect`, not `check` | `lib/expect.aura` | #4477 |
@@ -112,6 +116,5 @@ Each has a minimal repro in `probes/`.
 3. Float ABI kernels (`(Float Float) -> Float`), vector/opaque buffers through
    `ffi:pin-buffer`.
 4. ~~Turn `mutate:atomic-batch` back on~~ done (default on; `loop:sink-gated` shadow gate before the boundary, `lib/bg.aura` background builds, `lib/watch.aura` re-sink on edit).
-5. Hot-swap the scoring weights and `sink-min-speedup` from an outer agent loop,
-   and record accepted sinks as "stable data plane" in a manifest.
+5. ~~Hot-swap `sink-min-speedup` from an outer loop and record decisions~~ done (`lib/policy.aura`, JSONL trajectory). Next: feed the trajectory to aura-loop and learn the threshold / Soft floor per kernel shape.
 6. Restricted face: grant `effect:ffi`, check the AOT reload capability gate.

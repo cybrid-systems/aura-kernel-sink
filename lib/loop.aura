@@ -25,6 +25,8 @@
         loop:rolled-back?
         loop:rollback-ok?
         loop:stage
+        loop:t-before
+        loop:t-after
         loop:accepted?
         loop:print)
 
@@ -46,6 +48,8 @@
 (define (loop:rolled-back? r) (loop-nth r 7))
 (define (loop:rollback-ok? r) (loop-nth r 8))
 (define (loop:stage r) (loop-nth r 9))
+(define (loop:t-before r) (loop-nth r 5))
+(define (loop:t-after r) (loop-nth r 6))
 (define (loop:accepted? r) (string=? (loop:verdict r) "accept"))
 
 ; heal! and re-check the golden cases on the restored body.
@@ -84,10 +88,15 @@
 ;   cases         correctness inputs
 ;   bench-arg/reps  timing input and repetitions
 ;   min-speedup   usually (sink-min-speedup) from the workspace
+; Frame-only lists pinned in a global during an attempt (aura#4537: ~100
+; workspace calls can corrupt a list referenced only from a caller's frame).
+(define loop-pinned (list))
+
 (define (loop:sink-one plan plant probe cases bench-arg reps min-speedup)
-  (let ((name (sink-plan:name plan))
-        (golden (score:golden probe cases))
-        (t-before (score:bench probe bench-arg reps)))
+  (let* ((name (sink-plan:name plan))
+         (golden (score:golden probe cases))
+         (pin (set! loop-pinned (list plan plant probe cases golden)))
+         (t-before (score:bench probe bench-arg reps)))
     ; Rollback point first: last-good body + ast:snapshot.
     (hot-strategy:register! name (sink-plan:aura-body plan))
     (let ((boxed ((plant:load plant) plan)))
@@ -132,6 +141,7 @@
   (let* ((name (sink-plan:name plan))
          (ref (eval name))
          (golden (score:golden probe cases))
+         (pin (set! loop-pinned (list plan plant shadow-args probe cases golden)))
          (t-before (score:bench probe bench-arg reps)))
     (hot-strategy:register! name (sink-plan:aura-body plan))
     (let ((boxed ((plant:load plant) plan)))

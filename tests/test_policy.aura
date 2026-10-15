@@ -1,0 +1,98 @@
+; tests/test_policy.aura — profile-guided sink policy (lib/policy.aura):
+; KEEP above the threshold, ROLLBACK below it (heal to Soft), threshold
+; hot-swapped through the workspace (sink-min-speedup), SKIP when the Soft
+; define is too cheap to profit or vkgen cannot compile it; every decision is
+; one JSON line in a trajectory file that json-parse reads back.
+; Separate process: c-func ids collide with closure ids (aura#4532).
+(require "expect" all:)
+(require "fixture" all:)
+(require "plant" all:)
+(require "score" all:)
+(require "policy" all:)
+(require "watch" all:)
+(require "std/ffi" all:)
+(require "std/process" all:)
+(require "std/hot-strategy" all:)
+(score:set-rounds! 3)  ; best of 3 timed rounds (shared box, ms timer)
+(display "RUN-ONCE") (newline)
+
+(shell "scripts/clean_bg.sh; mkdir -p build; rm -f build/trajectory-test.jsonl")
+(define traj "build/trajectory-test.jsonl")
+(define plant (plant:real))
+(set-code (fixture:vector-workspace-code))
+(eval-current)
+
+(define (mkvec n seed)
+  (let ((v (make-f64vector n)))
+    (let loop ((i 0))
+      (if (< i n) (begin (f64vector-set! v i (- (* 0.1 (modulo (+ (* i 7919) seed) 1000)) 50.3)) (loop (+ i 1))) v))))
+(define va (mkvec 5000 17))
+(define vb (mkvec 5000 4242))
+(define vsmall (mkvec 10 3))
+(define vempty (make-f64vector 0))
+(define cases (list 0 1 2 7 49 333 999 5000))
+
+; ---- 1. vsum: well above the threshold -> KEEP
+(define sum-ref (vsum va 5000))
+(define r1 (policy:sink! plant "vsum" (list va 5000) (lambda (k) (vsum va k)) cases
+                         (list (list va 0) (list va 5000) (list vsmall 10) (list va 3.0))
+                         5000 10 50 #f traj))
+(policy:print r1)
+(expect "KEEP: vsum sunk (speedup over the workspace threshold 2)"
+        (and (equal? (policy:get r1 "decision") "KEEP") (= (policy:get r1 "threshold") 2) (>= (policy:get r1 "speedup") 2)))
+(expect "KEEP: committed (generation moved), answers bit-equal" (and (> (policy:get r1 "gen_after") (policy:get r1 "gen_before")) (equal? (vsum va 5000) sum-ref)))
+(expect "KEEP: registered with watch (clean)" (equal? (car (cdr (car (watch:check #t)))) "clean"))
+
+; ---- 2. vdot with an unreachable threshold -> ROLLBACK to Soft
+(define dot-ref (vdot va vb 5000))
+(define r2 (policy:sink! plant "vdot" (list va vb 5000) (lambda (k) (vdot va vb k)) cases
+                         (list (list va vb 0) (list va vb 5000) (list vsmall vb 10) (list va vb 3.0))
+                         5000 10 50 1000 traj))
+(policy:print r2)
+(expect "ROLLBACK: measured speedup below 1000 -> too-slow, healed"
+        (and (equal? (policy:get r2 "decision") "ROLLBACK") (equal? (policy:get r2 "reasons") (list "too-slow"))
+             (policy:get r2 "rolled_back") (policy:get r2 "rollback_ok")))
+(expect "ROLLBACK: vdot is the Soft body again, same answer" (and (equal? (vdot va vb 5000) dot-ref) (= (length (watch:entries)) 1)))
+
+; ---- 3. threshold hot-swapped in the workspace: (sink-min-speedup) -> 3
+(mutate:rebind "sink-min-speedup" "(lambda () 3)" "policy-swap")
+(eval-current)
+(define norm-ref (vnorm2 va))
+(define r3 (policy:sink! plant "vnorm2" (list va) (lambda (k) (vnorm2 va)) cases
+                         (list (list va) (list vsmall) (list vempty))
+                         0 10 50 #f traj))
+(policy:print r3)
+(expect "hot-swapped threshold: read 3 from the workspace policy define" (= (policy:get r3 "threshold") 3))
+(expect "hot-swapped threshold: vnorm2 KEEP, bit-equal" (and (equal? (policy:get r3 "decision") "KEEP") (equal? (vnorm2 va) norm-ref)))
+
+; ---- 4. too cheap to profit: SKIP at the profile stage, nothing compiled
+(define g4 (ast:generation))
+(define r4 (policy:sink! plant "vscaled" (list vsmall 0.5) (lambda (k) (vscaled vsmall 0.5)) cases
+                         (list (list vsmall 0.5)) 0 10 1000000 #f traj))
+(policy:print r4)
+(expect "SKIP profile: too-cheap, no .so, no mutation"
+        (and (equal? (policy:get r4 "decision") "SKIP") (equal? (policy:get r4 "stage") "profile")
+             (equal? (policy:get r4 "so") "") (= (ast:generation) g4)))
+
+; ---- 5. vkgen says no: SKIP at the compile stage with the reason
+(define r5 (policy:sink! plant "vbad-mix" (list va) (lambda (k) (vbad-mix va)) cases
+                         (list (list va)) 0 10 50 #f traj))
+(policy:print r5)
+(expect "SKIP compile: vbad-mix skipped with the vkgen reason"
+        (and (equal? (policy:get r5 "decision") "SKIP") (equal? (policy:get r5 "stage") "compile")
+             (equal? (car (policy:get r5 "reasons")) "skipped")))
+
+; ---- 6. the trajectory: one JSON line per decision, read back with json-parse
+(define rows (policy:read traj))
+(expect "trajectory: 5 JSON lines" (= (length rows) 5))
+(expect "trajectory: summary KEEP 2, ROLLBACK 1, ABORT 0, SKIP 2" (equal? (policy:summary traj) (list 2 1 0 2)))
+(expect "trajectory: fields round-trip (name, decision, kinds, threshold)"
+        (let ((h (car rows)))
+          (and (equal? (hash-ref h "name") "vsum") (equal? (hash-ref h "decision") "KEEP")
+               (equal? (hash-ref h "kinds") (list "V" "I")) (= (hash-ref h "threshold") 2))))
+(expect "trajectory: ROLLBACK row carries the measured speedup and both timings"
+        (let ((h (car (cdr rows))))
+          (and (equal? (hash-ref h "decision") "ROLLBACK") (> (hash-ref h "speedup") 1) (> (hash-ref h "t_before_ms") 0)
+               (equal? (hash-ref h "rolled_back") #t))))
+(expect "json: strings escaped" (equal? (policy:json (list (cons "a" "x\"y\\z"))) "{\"a\":\"x\\\"y\\\\z\"}"))
+(expect "checks all passed" (expect-summary))

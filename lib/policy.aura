@@ -1,0 +1,162 @@
+; lib/policy.aura — profile-guided sink policy + KEEP/ROLLBACK trajectories.
+;
+; policy:sink! runs one decision for one workspace define and appends one
+; JSON line to a trajectory file (for aura-loop / offline analysis):
+;
+;   1. profile   measure the Soft define (score:bench). Below min-soft-us per
+;                call the FFI + guard overhead (~40-60 us/call, README)
+;                would eat the gain: SKIP, nothing is compiled.
+;   2. compile   vkgen + background cc (lib/bg.aura); unsupported body or a
+;                failed build: SKIP with the reason.
+;   3. gate      shadow compare before the MutationBoundary: ABORT, no
+;                mutation at all.
+;   4. score     one atomic batch, then measured speedup vs the threshold:
+;                KEEP (and the define is registered with lib/watch.aura), or
+;                ROLLBACK (hot-strategy:heal! back to the Soft body).
+;
+; The threshold is an argument, or #f to read the workspace policy define
+; (sink-min-speedup), so an outer loop can hot-swap it with mutate:rebind.
+;
+; Row (alist of string keys, also the JSON object):
+;   ts name decision stage reasons kinds so threshold speedup soft_us_per_call
+;   t_before_ms t_after_ms reps bench_arg gen_before gen_after rolled_back
+;   rollback_ok
+;
+; No std list closures here (assoc, map, ...): the caller has usually made
+; many c-func calls already, and those collide with low closure ids
+; (aura#4532).
+
+(export policy:sink! policy:threshold policy:get policy:json policy:append!
+        policy:read policy:summary policy:print)
+
+(require "discover" all:)
+(require "vkgen" all:)
+(require "bg" all:)
+(require "watch" all:)
+(require "sink_plan" all:)
+(require "score" all:)
+(require "loop" all:)
+(require "std/process" all:)
+
+(define (policy:get row key)
+  (cond ((null? row) #f) ((equal? (car (car row)) key) (cdr (car row))) (else (policy:get (cdr row) key))))
+
+(define (policy:threshold t)
+  (if t t (try ((eval "sink-min-speedup")) (catch (e) 2))))
+
+; ---- JSON (own encoder: json-encode prints Floats with %f, 6 decimals)
+(define (pj-str s)
+  (let loop ((i 0) (start 0) (acc "\""))
+    (if (>= i (string-length s))
+        (string-append acc (substring s start i) "\"")
+        (let ((c (string-ref s i)))
+          (cond ((= c 34) (loop (+ i 1) (+ i 1) (string-append acc (substring s start i) "\\\"")))
+                ((= c 92) (loop (+ i 1) (+ i 1) (string-append acc (substring s start i) "\\\\")))
+                ((= c 10) (loop (+ i 1) (+ i 1) (string-append acc (substring s start i) "\\n")))
+                (else (loop (+ i 1) start acc)))))))
+(define (pj-val v)
+  (cond ((equal? v #t) "true")
+        ((equal? v #f) "false")
+        ((string? v) (pj-str v))
+        ((number? v) (number->string v))
+        ((null? v) "[]")
+        ((pair? v) (let loop ((xs v) (acc "[") (first #t))
+                     (if (null? xs) (string-append acc "]")
+                         (loop (cdr xs) (string-append acc (if first "" ",") (pj-val (car xs))) #f))))
+        (else "null")))
+(define (policy:json row)
+  (let loop ((xs row) (acc "{") (first #t))
+    (if (null? xs) (string-append acc "}")
+        (loop (cdr xs) (string-append acc (if first "" ",") (pj-str (car (car xs))) ":" (pj-val (cdr (car xs)))) #f))))
+
+(define (policy:append! path row)
+  (let ((old (read-file path)))
+    (write-file path (string-append (if (string? old) old "") (policy:json row) "\n"))
+    row))
+
+; Lines of the trajectory as json-parse hash tables.
+(define (policy:read path)
+  (let ((s (read-file path)))
+    (if (not (string? s)) (list)
+        (let loop ((ls (pr-lines s)) (acc (list)))
+          (cond ((null? ls) (pr-rev acc (list)))
+                ((= (string-length (car ls)) 0) (loop (cdr ls) acc))
+                (else (loop (cdr ls) (cons (json-parse (car ls)) acc))))))))
+; Own line splitter: std string-split is a closure, and after the sinks of
+; scripts/policy.aura it returned 0 (aura#4532).
+(define (pr-lines s)
+  (let loop ((i 0) (start 0) (acc (list)))
+    (cond ((>= i (string-length s)) (pr-rev (cons (substring s start i) acc) (list)))
+          ((= (string-ref s i) 10) (loop (+ i 1) (+ i 1) (cons (substring s start i) acc)))
+          (else (loop (+ i 1) start acc)))))
+(define (pr-rev xs acc) (if (null? xs) acc (pr-rev (cdr xs) (cons (car xs) acc))))
+
+; (keep rollback abort skip) counts of a trajectory file.
+(define (policy:summary path)
+  (let loop ((rs (policy:read path)) (k 0) (r 0) (a 0) (s 0))
+    (if (null? rs) (list k r a s)
+        (let ((d (hash-ref (car rs) "decision")))
+          (loop (cdr rs) (if (equal? d "KEEP") (+ k 1) k) (if (equal? d "ROLLBACK") (+ r 1) r)
+                (if (equal? d "ABORT") (+ a 1) a) (if (equal? d "SKIP") (+ s 1) s))))))
+
+(define (policy-row name decision stage reasons kinds so threshold speedup soft-us tb ta reps arg g0 rolled ok)
+  (list (cons "ts" (current-time-ms)) (cons "name" name) (cons "decision" decision) (cons "stage" stage)
+        (cons "reasons" reasons) (cons "kinds" (if kinds kinds (list))) (cons "so" so)
+        (cons "threshold" threshold) (cons "speedup" speedup) (cons "soft_us_per_call" soft-us)
+        (cons "t_before_ms" tb) (cons "t_after_ms" ta) (cons "reps" reps) (cons "bench_arg" arg)
+        (cons "gen_before" g0) (cons "gen_after" (ast:generation))
+        (cons "rolled_back" rolled) (cons "rollback_ok" ok)))
+
+; plant: a top-level bound (plant:real) (aura#4481). shadow: argument lists
+; for the gate. probe/cases/bench-arg/reps: as for loop:sink-gated.
+; Profile: one short timed round (no warm-up). Every workspace call counts
+; toward the aura#4537 window, so the profile stays small and the build wait
+; sleeps instead of serving Soft calls.
+(define (pr-time probe arg n)
+  (let ((t0 (current-time-ms)))
+    (let loop ((i 0)) (if (< i n) (begin (probe arg) (loop (+ i 1))) 0))
+    (- (current-time-ms) t0)))
+
+; Lists held only by this frame are pinned in a module global: ~100 calls to
+; a workspace define can corrupt a host list referenced only from a caller's
+; argument (aura#4537).
+(define policy-pinned (list))
+(define (policy:sink! plant name samples probe cases shadow bench-arg reps min-soft-us threshold path)
+  (let* ((g0 (ast:generation))
+         (thr (policy:threshold threshold))
+         (tree (watch:tree-of name (discover:defines (discover:scan)))))
+    (set! policy-pinned (list plant samples probe cases shadow tree))
+    (if (not tree)
+        (policy:append! path (policy-row name "SKIP" "discover" (list "no-define") #f "" thr 0.0 0.0 0 0 reps bench-arg g0 #f #t))
+        (let* ((pn (if (< reps 4) 2 (quotient reps 2)))
+               (t-soft (pr-time probe bench-arg pn))
+               (soft-us (/ (* 1000.0 t-soft) pn)))
+          (if (< soft-us min-soft-us)
+              (policy:append! path (policy-row name "SKIP" "profile" (list "too-cheap") #f "" thr 0.0 soft-us t-soft 0 reps bench-arg g0 #f #t))
+              (let ((kinds (vkgen:kinds tree samples)))
+                (if (not kinds)
+                    (policy:append! path (policy-row name "SKIP" "compile" (list "no-vector-kinds") #f "" thr 0.0 soft-us t-soft 0 reps bench-arg g0 #f #t))
+                    (let ((job (car (bg:wait-serving (bg:launch! name tree kinds) (lambda () (shell "sleep 0.02")) 120000))))
+                      (if (not (bg:ready? job))
+                          (policy:append! path (policy-row name "SKIP" "compile" (list (bg:job-status job) (bg:job-reason job)) kinds "" thr 0.0 soft-us t-soft 0 reps bench-arg g0 #f #t))
+                          (let* ((body (discover:write tree))
+                                 (sym (bg:job-symbol job)) (ret (bg:job-ret job))
+                                 (plan (sink-plan:make-custom name (bg:job-so job) sym (vkgen:sig kinds ret) (length kinds) body
+                                                              (lambda (lib) (vkgen:bind-body name sym kinds ret lib body))))
+                                 (r (loop:sink-gated plan plant shadow probe cases bench-arg reps thr))
+                                 (decision (cond ((loop:accepted? r) "KEEP")
+                                                 ((equal? (loop:stage r) "gate") "ABORT")
+                                                 ((equal? (loop:stage r) "load") "ABORT")
+                                                 (else "ROLLBACK"))))
+                            (if (loop:accepted? r) (watch:register! name (sink-plan:wrapper plan) samples) #f)
+                            (policy:append! path (policy-row name decision (loop:stage r) (loop:reasons r) kinds (bg:job-so job) thr
+                                                             (loop:speedup r) soft-us (loop:t-before r) (loop:t-after r) reps bench-arg g0
+                                                             (loop:rolled-back? r) (loop:rollback-ok? r)))))))))))))
+
+(define (policy:print row)
+  (display "  [policy] ") (display (policy:get row "name")) (display ": ")
+  (display (policy:get row "decision")) (display " stage=") (display (policy:get row "stage"))
+  (display " reasons=") (display (policy:get row "reasons"))
+  (display " speedup=") (display (policy:get row "speedup"))
+  (display " threshold=") (display (policy:get row "threshold"))
+  (display " soft-us/call=") (display (policy:get row "soft_us_per_call")) (newline))
