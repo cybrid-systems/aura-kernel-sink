@@ -1,0 +1,55 @@
+; lib/watch.aura — dirty tracking for sunk defines.
+;
+; Every sink records (name wrapper generation samples). (ast:generation) is
+; the engine's workspace mutation counter: watch:check does nothing while it
+; is unchanged (the fast path), and otherwise re-reads the workspace
+; (discover:scan) and compares each sunk define's tree with the wrapper it
+; was sunk as:
+;   "clean"    still the sunk wrapper
+;   "edited"   someone rebound the define: its kernel is stale (the new body
+;              is already live, so answers are right, just slow again)
+;   "removed"  the define is gone
+; Rows: (name status new-tree samples). The sink's own mutations go through
+; watch:register! afterwards, so they never show up as edits.
+
+(export watch:register! watch:forget! watch:entries watch:check watch:generation watch:tree-of)
+
+(require "discover" all:)
+
+(define watch-reg (list))
+(define watch-gen -1)
+
+(define (watch:generation) (ast:generation))
+(define (watch:entries) watch-reg)
+
+(define (wt-drop name xs)
+  (cond ((null? xs) (list)) ((equal? (car (car xs)) name) (wt-drop name (cdr xs))) (else (cons (car xs) (wt-drop name (cdr xs))))))
+
+(define (watch:tree-of name defs)
+  (cond ((null? defs) #f) ((equal? (car (car defs)) name) (car (cdr (car defs)))) (else (watch:tree-of name (cdr defs)))))
+
+(define (wt-wrapper-tree name wrapper)
+  (car (cdr (car (discover:defines (discover:read (string-append "(define " name " " wrapper ")")))))))
+
+(define (watch:register! name wrapper samples)
+  (set! watch-reg (cons (list name (wt-wrapper-tree name wrapper) samples) (wt-drop name watch-reg)))
+  (set! watch-gen (ast:generation))
+  #t)
+(define (watch:forget! name) (set! watch-reg (wt-drop name watch-reg)) #t)
+
+; force: scan even when the generation did not move
+(define (watch:check force)
+  (if (and (not force) (equal? (ast:generation) watch-gen))
+      (wt-all-clean watch-reg)
+      (let ((defs (discover:defines (discover:scan))))
+        (set! watch-gen (ast:generation))
+        (let loop ((es watch-reg) (acc (list)))
+          (if (null? es) acc
+              (let* ((e (car es)) (now (watch:tree-of (car e) defs)))
+                (loop (cdr es)
+                      (cons (list (car e)
+                                  (cond ((not now) "removed") ((equal? now (car (cdr e))) "clean") (else "edited"))
+                                  now (car (cdr (cdr e))))
+                            acc))))))))
+(define (wt-all-clean es)
+  (if (null? es) (list) (cons (list (car (car es)) "clean" #f (car (cdr (cdr (car es))))) (wt-all-clean (cdr es)))))

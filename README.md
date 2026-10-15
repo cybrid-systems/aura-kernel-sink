@@ -111,6 +111,14 @@ checks: 8 passed, 0 failed
 
 下沉后和裸 c-func 之间的差距，是 wrapper 的守卫开销加上 String 参数的整段拷贝（aura#4531 里提了零拷贝借用槽位的需求）。
 
+### 后台编译 + 门控换入 + 编辑重沉（`lib/bg.aura`、`lib/watch.aura`、`loop:sink-gated`）
+
+- **后台编译**：`bg:launch!` 把 vkgen 生成的 C 源按内容哈希命名（`build/kernels/libvgen_<name>_<hash>.so`），以分离的 OS 进程（`kernels/build_one.sh … &`，写完 `.done` 再原子 `mv`）编译，立即返回 `pending`。同一份 C 源已经编过就直接返回 `cached`，不支持的函数体返回 `skipped` 并带原因。`bg:wait-serving` 在等待期间继续调用 Soft define 服务请求（测试里 cc 运行期间服务了 13 次 Soft 调用）。`bg:launch-fiber!` 把同一流程放进 fiber，`fiber:join` 取结果。注意：thread 后端上 fiber 和主求值器是串行的（aura#2738），fiber 里 `shell "sleep 1"` 不会和主线程重叠，所以真正的并行来自分离的 cc 进程，不来自 fiber。
+- **门控换入（MutationBoundary 之前中止）**：`loop:sink-gated` 先在宿主侧对 bind body 求值，用 `shadow-args` 逐个和当前 define（`(eval name)`）比对结果（含 deopt 参数、出错要一致）。不一致就在 `gate` 阶段以 `gate-mismatch` 拒绝，**不产生任何 mutation**（`ast:generation` 不变，不需要回滚）。通过后在一个 `mutate:atomic-batch`（一次 MutationBoundary）里 bind 槽位 + 换 wrapper，再 `eval-current` + 评分，不达标就 heal。`mutate:atomic-batch` 已默认打开（#4476 已修）。
+- **脏追踪驱动的重编**：`watch:register!` 记下已下沉 define 的 wrapper 和样本参数。`watch:check` 先看 `ast:generation`：没变就是 clean（快路径），变了再用 `discover:scan` 比树，得到 `clean/edited/removed` 和新树。用户编辑一个已下沉的 define（`mutate:rebind`）后，新体立即以 Soft 生效，`watch:check` 报告 `edited`，后台按新树重编，再门控换入。改成不支持的体就保持 Soft，job 状态为 `skipped`（原因如 `unsupported call exp`）；改回之前的体命中缓存（`cached`，同一个 .so）。
+
+测试 `tests/test_bg.aura`（28 项）：后台构建、门控接受、错一位 kernel 在门口被拒（generation 不变）、编辑检测 + 重沉、不支持的编辑保持 Soft、缓存命中、fiber 构建 + vdot 门控下沉。
+
 ### 值编码 ABI（单一来源）
 
 `kernels/sink_abi.h` 不再自己写编码常量，而是直接包含 Aura 的 `lib/aura_value_abi.h`（aura#4502，ABI 4）：`kernels/build.sh` 加 `-I$AURA_LIB`，该头文件变化时重编所有 kernel；fixnum 范围取自 `AURA_FIXNUM_MIN/MAX`，低于 ABI 4 直接 `#error`。每个 kernel 导出 `aura_sink_value_abi()`，`plant:real` 在 `c-load` 后、任何 mutation 之前检查它，不匹配就在 load 阶段拒绝（`kernels/stale_abi.c` 对应测试）。
@@ -127,7 +135,7 @@ checks: 8 passed, 0 failed
 | `c-load` + `c-func` 绑定 | **真跑** |
 | `mutate:rebind` 换封装 + `eval-current` | **真跑** |
 | 评分 / 接受 / `hot-strategy:heal!` 回滚 + golden 复查 | **真跑** |
-| `mutate:atomic-batch` 一次边界内 bind+swap | **已写好，默认关闭**：上游 bug（见下），用两次 `mutate:rebind` 代替 |
+| `mutate:atomic-batch` 一次边界内 bind+swap | **真跑，默认打开**（#4476 已修）；`loop:sink-gated` 在边界前做影子门控 |
 | FakePlant | 同一闭环、Aura 替身体（闭式公式/错一位/慢 4 倍），任何构建都能跑 |
 
 ### 已知上游问题（Aura，均已在本仓库 `probes/` 里给出最小复现）
@@ -226,6 +234,14 @@ Tests: `tests/test_vkgen.aura` and `tests/test_vkgen_more.aura`. They are split 
 
 The gap between sunk and raw c-func is the wrapper's guards plus the full copy of each String arg (aura#4531 also asks for a zero-copy borrowed slot).
 
+### Background compile + gated swap + re-sink on edit (`lib/bg.aura`, `lib/watch.aura`, `loop:sink-gated`)
+
+- **Background compile**: `bg:launch!` names the vkgen C source by content hash (`build/kernels/libvgen_<name>_<hash>.so`), compiles it in a detached OS process (`kernels/build_one.sh … &`, `.done` written then `mv`ed atomically), and returns `pending` at once. A C source that was already built returns `cached`; an unsupported body returns `skipped` with the reason. `bg:wait-serving` keeps serving calls to the Soft define while it waits (13 Soft calls served during cc in the test). `bg:launch-fiber!` runs the same pipeline in a fiber, joined with `fiber:join`. Note: on the thread backend fibers are serialized with the main evaluator (aura#2738): a fiber's `shell "sleep 1"` does not overlap main work. The real parallelism comes from the detached cc process, not from the fiber.
+- **Gated swap, aborted before the MutationBoundary**: `loop:sink-gated` evaluates the bind body host-side and compares it on `shadow-args` against the current define (`(eval name)`), including deopt arguments and matching errors. On any mismatch it rejects at stage `gate` with `gate-mismatch`, and **no mutation happens** (`ast:generation` unchanged, nothing to roll back). If the gate passes, slot bind and wrapper swap run in one `mutate:atomic-batch` (one MutationBoundary), followed by `eval-current` and scoring, with a heal if the score fails. `mutate:atomic-batch` is now on by default (#4476 fixed).
+- **Dirty-tracking re-sink**: `watch:register!` records a sunk define's wrapper and sample args. `watch:check` first compares `ast:generation`: if unchanged, the define is clean (fast path). Otherwise it compares trees from `discover:scan` and returns `clean/edited/removed` plus the new tree. When the user edits a sunk define (`mutate:rebind`), the new body is live at once on Soft and `watch:check` reports `edited`. The background job then rebuilds from the new tree and swaps it in through the gate. An edit to an unsupported body stays Soft with job status `skipped` (e.g. `unsupported call exp`). An edit back to an earlier body is a cache hit (`cached`, same .so).
+
+Test `tests/test_bg.aura` (28 checks) covers: background build, gated accept, an off-by-one kernel rejected at the gate (generation unchanged), edit detection + re-sink, an unsupported edit staying Soft, a cache hit, and a fiber build + gated vdot sink.
+
 ### Value ABI (single source)
 
 `kernels/sink_abi.h` restates no encoding constant: it includes Aura's `lib/aura_value_abi.h` (aura#4502, ABI 4). `kernels/build.sh` adds `-I$AURA_LIB` and rebuilds every kernel when that header changes; the fixnum range comes from `AURA_FIXNUM_MIN/MAX`; anything below ABI 4 is an `#error`. Every kernel exports `aura_sink_value_abi()`, and `plant:real` checks it right after `c-load`, before any mutation, refusing a mismatch at the load stage (tested with `kernels/stale_abi.c`).
@@ -242,7 +258,7 @@ The gap between sunk and raw c-func is the wrapper's guards plus the full copy o
 | `c-load` + `c-func` binding | **real** |
 | `mutate:rebind` wrapper + `eval-current` | **real** |
 | score / accept / `hot-strategy:heal!` rollback + golden re-check | **real** |
-| bind + swap in one `mutate:atomic-batch` | **implemented, off by default** (upstream bug); two `mutate:rebind` calls instead |
+| bind + swap in one `mutate:atomic-batch` | **real, on by default** (#4476 fixed); `loop:sink-gated` runs a shadow gate before the boundary |
 | FakePlant | same loop with Aura stand-in bodies (closed form / off by one / 4× slower) |
 
 The default (Restricted) face is not supported yet: on `c4fc6cf23` the std

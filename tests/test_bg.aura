@@ -1,0 +1,145 @@
+; tests/test_bg.aura — background compile + gated MutationBoundary swap +
+; dirty-tracking re-sink (lib/bg.aura, lib/watch.aura, loop:sink-gated).
+;   1. background build: cc runs as a detached process while the app keeps
+;      calling the Soft define; then shadow gate, one atomic-batch, accept
+;   2. a wrong kernel is caught by the shadow gate: ABORT before any mutation
+;   3. a user edit of a sunk define is seen through ast:generation; the new
+;      body is re-sunk from a fresh background build
+;   4. an edit to an unsupported body stays Soft (skip with reason)
+;   5. an edit back to an earlier body is a cache hit (no rebuild)
+;   6. the same pipeline inside fiber:spawn
+(require "expect" all:)
+(require "fixture" all:)
+(require "discover" all:)
+(require "vkgen" all:)
+(require "bg" all:)
+(require "watch" all:)
+(require "sink_plan" all:)
+(require "plant" all:)
+(require "loop" all:)
+(require "std/ffi" all:)
+(require "std/fs" all:)
+(require "std/process" all:)
+(require "std/hot-strategy" all:)
+(display "RUN-ONCE") (newline)
+
+(define plant (plant:real))
+(define (has-sub? s sub)
+  (let ((n (string-length s)) (m (string-length sub)))
+    (let loop ((i 0)) (cond ((> (+ i m) n) #f) ((string=? (substring s i (+ i m)) sub) #t) (else (loop (+ i 1)))))))
+(define (my-map f xs) (if (null? xs) (list) (cons (f (car xs)) (my-map f (cdr xs)))))
+; fresh kernel cache for this run (content-addressed .so names)
+(shell (string-append (getenv "SINK_ROOT") "/scripts/clean_bg.sh"))
+
+; Tree of the off-by-one body (host-only define), read before the real
+; workspace is set up.
+(set-code (fixture:vector-src))
+(eval-current)
+(define wrong-tree (watch:tree-of "vsum-wrong" (discover:defines (discover:scan))))
+
+(set-code (fixture:vector-workspace-code))
+(eval-current)
+(define (tree-now name) (watch:tree-of name (discover:defines (discover:scan))))
+
+(define (mkvec n seed)
+  (let ((v (make-f64vector n)))
+    (let loop ((i 0))
+      (if (< i n) (begin (f64vector-set! v i (- (* 0.1 (modulo (+ (* i 7919) seed) 1000)) 50.3)) (loop (+ i 1))) v))))
+(define va (mkvec 5000 17))
+(define vb (mkvec 5000 4242))
+(define vsmall (mkvec 10 3))
+(define cases (list 0 1 2 7 49 333 999 5000))
+; No out-of-bounds probe here: Soft raises on it correctly, but in an
+; eval-current workspace define the caught error is still printed to stderr
+; (aura#4535), and run_tests.sh fails on stderr `error:` lines. Bounds are
+; covered in test_vkgen.aura. Restore (list vsmall 11) once #4535 is fixed.
+(define shadow (list (list va 0) (list va 1) (list va 4999) (list va 5000) (list vsmall 10) (list va 3.0)))
+(define probe (lambda (k) (vsum va k)))
+(define samples (list va 5000))
+(define kinds-vi (list "V" "I"))
+
+(define (plan-for job body)
+  (let ((name (bg:job-name job)) (kinds (bg:job-kinds job)) (sym (bg:job-symbol job)) (ret (bg:job-ret job)))
+    (sink-plan:make-custom name (bg:job-so job) sym (vkgen:sig kinds ret) (length kinds) body
+                           (lambda (lib) (vkgen:bind-body name sym kinds ret lib body)))))
+(define (wait! job) (car (bg:wait-serving job (lambda () (shell "sleep 0.02")) 60000)))
+
+; ---- 1. background build while the app keeps calling the Soft define
+(define job (bg:launch! "vsum" (tree-now "vsum") (vkgen:kinds (tree-now "vsum") samples)))
+(expect "bg 1: launched, build pending (detached cc)" (equal? (bg:job-status job) "pending"))
+(define soft-ref (vsum va 5000))
+(define served (bg:wait-serving job (lambda () (vsum va 5000)) 60000))
+(set! job (car served))
+(display (list "soft calls served while cc ran:" (cdr served))) (newline)
+(expect "bg 1: build ok" (equal? (bg:job-status job) "ok"))
+(expect "bg 1: the app kept running during the build (>= 1 Soft call served)" (>= (cdr served) 1))
+(expect "bg 1: .so is content-addressed" (has-sub? (bg:job-so job) "libvgen_vsum_"))
+(define gen0 (ast:generation))
+(define r (loop:sink-gated (plan-for job (fixture:vector-body "vsum")) plant shadow probe cases 5000 10 (sink-min-speedup)))
+(loop:print r)
+(expect "bg 1: gated sink accepted" (loop:accepted? r))
+(expect "bg 1: committed (generation moved)" (> (ast:generation) gen0))
+(expect "bg 1: sunk answers are bit-equal" (equal? (vsum va 5000) soft-ref))
+(define wrapper (sink-plan:wrapper (plan-for job "")))
+(watch:register! "vsum" wrapper samples)
+(expect "watch: clean right after the sink" (equal? (car (cdr (car (watch:check #t)))) "clean"))
+(expect "watch: fast path (no generation change) reports clean" (equal? (car (cdr (car (watch:check #f)))) "clean"))
+
+; ---- 2. wrong kernel (off by one) for vsum: the shadow gate aborts BEFORE the boundary
+(define wjob (wait! (bg:launch! "vsum" wrong-tree kinds-vi)))
+(expect "bg 2: wrong kernel built (different content hash)" (and (equal? (bg:job-status wjob) "ok") (not (equal? (bg:job-so wjob) (bg:job-so job)))))
+(define gen1 (ast:generation))
+(set! r (loop:sink-gated (plan-for wjob (fixture:vector-body "vsum")) plant shadow probe cases 5000 10 (sink-min-speedup)))
+(loop:print r)
+(expect "bg 2: rejected at the gate (gate-mismatch)" (and (not (loop:accepted? r)) (equal? (loop:stage r) "gate") (equal? (loop:reasons r) (list "gate-mismatch"))))
+(expect "bg 2: aborted before the MutationBoundary: generation unchanged" (= (ast:generation) gen1))
+(expect "bg 2: nothing rolled back, still the good kernel" (and (not (loop:rolled-back? r)) (equal? (vsum va 5000) soft-ref)))
+(expect "watch: still clean after the aborted attempt" (equal? (car (cdr (car (watch:check #f)))) "clean"))
+
+; ---- 3. user edit of the sunk define -> dirty -> background re-sink
+(define body2 "(lambda (v n) (let loop ((i 0) (s 0.0)) (if (< i n) (loop (+ i 1) (+ s (* 2.0 (f64vector-ref v i)))) s)))")
+(mutate:rebind "vsum" body2 "user-edit")
+(eval-current)
+(expect "edit: new body is live at once (Soft), 2x the old sum exactly" (equal? (vsum va 5000) (* 2.0 soft-ref)))
+(define w (car (watch:check #f)))
+(expect "watch: edit detected (generation moved, tree differs from the wrapper)" (equal? (car (cdr w)) "edited"))
+(define job2 (wait! (bg:launch! "vsum" (car (cdr (cdr w))) (vkgen:kinds (car (cdr (cdr w))) (car (cdr (cdr (cdr w))))))))
+(expect "edit: re-sink build ok" (equal? (bg:job-status job2) "ok"))
+(set! r (loop:sink-gated (plan-for job2 body2) plant shadow probe cases 5000 10 (sink-min-speedup)))
+(loop:print r)
+(expect "edit: re-sunk (accepted)" (loop:accepted? r))
+(expect "edit: re-sunk answers match the edited body" (equal? (vsum va 5000) (* 2.0 soft-ref)))
+(watch:register! "vsum" wrapper samples)
+(expect "watch: clean again after the re-sink" (equal? (car (cdr (car (watch:check #f)))) "clean"))
+
+; ---- 4. edit to a body vkgen cannot compile: stays Soft, skip with a reason
+(define body3 "(lambda (v n) (let loop ((i 0) (s 0.0)) (if (< i n) (loop (+ i 1) (+ s (exp (f64vector-ref v i)))) s)))")
+(define ref3 ((eval body3) vsmall 10))
+(mutate:rebind "vsum" body3 "user-edit-2")
+(eval-current)
+(set! w (car (watch:check #f)))
+(expect "watch: second edit detected" (equal? (car (cdr w)) "edited"))
+(define job3 (bg:launch! "vsum" (car (cdr (cdr w))) kinds-vi))
+(expect "unsupported edit: skipped with reason (exp)" (and (equal? (bg:job-status job3) "skipped") (has-sub? (bg:job-reason job3) "exp")))
+(expect "unsupported edit: define stays Soft and correct" (equal? (vsum vsmall 10) ref3))
+
+; ---- 5. edit back to body2: same C source -> cache hit, no rebuild
+(mutate:rebind "vsum" body2 "user-edit-3")
+(eval-current)
+(set! w (car (watch:check #f)))
+(define job4 (bg:launch! "vsum" (car (cdr (cdr w))) kinds-vi))
+(expect "cache: edit back to an already-compiled body is a cache hit" (and (equal? (bg:job-status job4) "cached") (equal? (bg:job-so job4) (bg:job-so job2))))
+(set! r (loop:sink-gated (plan-for job4 body2) plant shadow probe cases 5000 10 (sink-min-speedup)))
+(expect "cache: re-sunk from the cached .so" (and (loop:accepted? r) (equal? (vsum va 5000) (* 2.0 soft-ref))))
+
+; ---- 6. the same pipeline inside a fiber
+(define fb (bg:launch-fiber! "vdot" (tree-now "vdot") (list "V" "V" "I") 60000))
+(define fjob (fiber:join fb))
+(expect "fiber: background build joined ok" (bg:ready? fjob))
+(define dot-ref (vdot va vb 5000))
+(set! r (loop:sink-gated (plan-for fjob (fixture:vector-body "vdot")) plant
+                         (list (list va vb 5000) (list va vb 0) (list vsmall vb 10))
+                         (lambda (k) (vdot va vb k)) cases 5000 10 (sink-min-speedup)))
+(loop:print r)
+(expect "fiber: vdot sunk through the gated boundary" (and (loop:accepted? r) (equal? (vdot va vb 5000) dot-ref)))
+(expect "checks all passed" (expect-summary))

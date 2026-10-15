@@ -15,6 +15,7 @@
 ;   stage  "load" | "bind" | "score" — where the attempt ended
 
 (export loop:sink-one
+        loop:sink-gated
         loop:set-atomic-batch!
         loop:name
         loop:plant
@@ -55,11 +56,11 @@
 ;; Bind the kernel slot and swap the wrapper in.
 ;; Default: two mutate:rebind calls (slot first, then wrapper), each its own
 ;; MutationBoundary; a failure in between is healed by the caller.
-;; (loop:set-atomic-batch! #t) uses ONE mutate:atomic-batch instead. That is
-;; the intended shape, but on the pinned tip a two-op atomic-batch followed by
-;; ast:restore inside one top-level form makes the Soft file runner silently
-;; re-run the whole file (aura#4476; see IMPROVEMENTS.md), so it is off.
-(define *loop-atomic-batch* #f)
+;; Default (since aura#4476 was fixed): ONE mutate:atomic-batch, i.e. one
+;; MutationBoundary for slot bind + wrapper swap; a failing sub-op rolls the
+;; whole batch back. (loop:set-atomic-batch! #f) restores the old two-rebind
+;; path (each its own boundary, a failure in between healed by the caller).
+(define *loop-atomic-batch* #t)
 (define (loop:set-atomic-batch! on) (set! *loop-atomic-batch* (if on #t #f)) *loop-atomic-batch*)
 
 (define (loop-bind-and-swap plan plant lib)
@@ -110,6 +111,53 @@
                         (loop-result plan plant "reject" (score:reasons s) (score:speedup s)
                                      t-before (score:t-after s)
                                      #t (loop-rollback probe golden) "score"))))))))))
+
+; Gated sink (background-compile path, lib/bg.aura):
+;   1. golden + t-before on the live define, rollback point (register!)
+;   2. load the kernel (ABI + symbol probes), nothing mutated yet
+;   3. SHADOW GATE: build the slot closure host-side from the same bind body
+;      and compare it with the live define on shadow-args (argument lists);
+;      a mismatch ABORTS before the MutationBoundary: no mutation, no heal,
+;      stage "gate"
+;   4. commit: bind + swap in one mutate:atomic-batch, eval-current
+;   5. score (bench + golden) -> accept, or heal! back
+(define (loop-shadow-ok? k ref shadow-args)
+  (let walk ((as shadow-args))
+    (if (null? as) #t
+        (let ((want (try (list (apply ref (car as))) (catch (e) "error")))
+              (got (try (list (apply k (car as))) (catch (e) "error"))))
+          (if (equal? want got) (walk (cdr as)) #f)))))
+
+(define (loop:sink-gated plan plant shadow-args probe cases bench-arg reps min-speedup)
+  (let* ((name (sink-plan:name plan))
+         (ref (eval name))
+         (golden (score:golden probe cases))
+         (t-before (score:bench probe bench-arg reps)))
+    (hot-strategy:register! name (sink-plan:aura-body plan))
+    (let ((boxed ((plant:load plant) plan)))
+      (if (not boxed)
+          (loop-result plan plant "reject" (list "load-failed") 0.0 t-before 0 #f #t "load")
+          (let ((k (try (eval ((plant:bind-body plant) plan (car boxed))) (catch (e) #f))))
+            (if (not (and k (loop-shadow-ok? k ref shadow-args)))
+                (loop-result plan plant "reject" (list "gate-mismatch") 0.0 t-before 0 #f #t "gate")
+                (let ((saved *loop-atomic-batch*))
+                  (set! *loop-atomic-batch* #t)
+                  (let ((batch (loop-bind-and-swap plan plant (car boxed))))
+                    (set! *loop-atomic-batch* saved)
+                    (if (not (equal? batch #t))
+                        (loop-result plan plant "reject" (list "bind-failed") 0.0 t-before 0
+                                     #t (loop-rollback probe golden) "bind")
+                        (begin
+                          (eval-current)
+                          (let ((s (score:evaluate golden t-before probe bench-arg reps min-speedup)))
+                            (if (score:accept? s)
+                                (begin
+                                  (hot-strategy:register! name (sink-plan:wrapper plan))
+                                  (loop-result plan plant "accept" (list) (score:speedup s)
+                                               t-before (score:t-after s) #f #t "score"))
+                                (loop-result plan plant "reject" (score:reasons s) (score:speedup s)
+                                             t-before (score:t-after s)
+                                             #t (loop-rollback probe golden) "score")))))))))))))
 
 (define (loop:print r)
   (display "  [") (display (loop:plant r)) (display "] ") (display (loop:name r))

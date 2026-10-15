@@ -1,0 +1,92 @@
+; lib/bg.aura — background kernel compile.
+;
+; bg:launch! generates the C source in Aura (vkgen, milliseconds) and starts
+; the C compiler as a DETACHED OS process (kernels/build_one.sh ... &), so the
+; caller keeps serving the Soft define while cc runs on another core. The
+; .so name carries a hash of the C source:
+;   build/kernels/lib<vgen_name>_<hash>.so
+; so an edit that comes back to an already-compiled body is a cache hit (no
+; rebuild), and a new kernel never overwrites one that is still loaded.
+;
+; Job: (name kinds ret so symbol done status reason)
+;   status "pending" | "ok" | "cached" | "fail" | "skipped" (vkgen said no)
+; bg:poll reads the done marker the build writes (exit code), never blocks.
+; bg:wait-serving polls while calling a work thunk between polls (the app
+; keeps running on the Soft body) and returns (job . calls-served).
+;
+; bg:launch-fiber! runs launch + wait inside fiber:spawn. On the pinned Aura
+; the thread backend serializes fiber bodies against the main evaluator
+; (#2738), so a fiber gives no overlap with main-thread Aura work; the
+; detached build process is what runs in parallel (see IMPROVEMENTS.md).
+
+(export bg:launch! bg:launch-fiber! bg:poll bg:wait-serving bg:ready? bg:hash
+        bg:job-name bg:job-kinds bg:job-ret bg:job-so bg:job-symbol bg:job-status bg:job-reason)
+
+(require "std/process" all:)
+(require "std/fs" all:)
+(require "vkgen" all:)
+
+(define (bg-nth xs k) (if (= k 0) (car xs) (bg-nth (cdr xs) (- k 1))))
+(define (bg:job-name j) (bg-nth j 0))
+(define (bg:job-kinds j) (bg-nth j 1))
+(define (bg:job-ret j) (bg-nth j 2))
+(define (bg:job-so j) (bg-nth j 3))
+(define (bg:job-symbol j) (bg-nth j 4))
+(define (bg-job-done j) (bg-nth j 5))
+(define (bg:job-status j) (bg-nth j 6))
+(define (bg:job-reason j) (bg-nth j 7))
+(define (bg-with-status j st reason)
+  (list (bg:job-name j) (bg:job-kinds j) (bg:job-ret j) (bg:job-so j) (bg:job-symbol j) (bg-job-done j) st reason))
+(define (bg:ready? j) (or (equal? (bg:job-status j) "ok") (equal? (bg:job-status j) "cached")))
+
+(define (bg-root)
+  (let ((r (getenv "SINK_ROOT"))) (if (and (string? r) (> (string-length r) 0)) r ".")))
+
+; 31-bit polynomial hash of a string (content address for the .so name).
+(define (bg:hash s)
+  (let loop ((i 0) (h 7))
+    (if (>= i (string-length s)) h
+        (loop (+ i 1) (modulo (+ (* h 131) (string-ref s i)) 2147483647)))))
+
+(define (bg:launch! name tree kinds)
+  (let ((r (vkgen:compile name tree kinds)))
+    (if (not (car r))
+        (list name kinds #f "" "" "" "skipped" (car (cdr r)))
+        (let* ((src (car (cdr r))) (ret (car (cdr (cdr r))))
+               (base (string-append (vkgen:base name) "_" (number->string (bg:hash src))))
+               (dir (string-append (bg-root) "/build/gen-bg"))
+               (cpath (string-append dir "/" base ".c"))
+               (so (string-append (bg-root) "/build/kernels/lib" base ".so"))
+               (done (string-append dir "/" base ".done"))
+               (log (string-append dir "/" base ".log"))
+               (job (list name kinds ret so (vkgen:symbol name) done "pending" "")))
+          (if (file-exists? so)
+              (bg-with-status job "cached" "")
+              (begin
+                (shell (string-append "mkdir -p " dir " " (bg-root) "/build/kernels && rm -f " done))
+                (write-file cpath src)
+                (shell (string-append "( " (bg-root) "/kernels/build_one.sh " cpath " " so " > " log " 2>&1; echo $? > " done ".tmp; mv " done ".tmp " done " ) > /dev/null 2>&1 &"))
+                job))))))
+
+(define (bg:poll j)
+  (if (and (equal? (bg:job-status j) "pending") (file-exists? (bg-job-done j)))
+      (let ((code (read-file (bg-job-done j))))
+        (if (and (string? code) (> (string-length code) 0) (= (string-ref code 0) 48))
+            (bg-with-status j "ok" "")
+            (bg-with-status j "fail" (string-append "cc failed, see " (bg-job-done j) " / .log"))))
+      j))
+
+; Poll until done or timeout-ms, calling (work) between polls.
+(define (bg:wait-serving j work timeout-ms)
+  (let ((t0 (current-time-ms)))
+    (let loop ((j j) (served 0))
+      (let ((j2 (bg:poll j)))
+        (cond ((not (equal? (bg:job-status j2) "pending")) (cons j2 served))
+              ((> (- (current-time-ms) t0) timeout-ms) (cons (bg-with-status j2 "fail" "timeout") served))
+              (else (work) (loop j2 (+ served 1))))))))
+
+; Launch + wait inside a fiber; (fiber:join f) -> job.
+(define (bg:launch-fiber! name tree kinds timeout-ms)
+  (fiber:spawn
+   (lambda ()
+     (car (bg:wait-serving (bg:launch! name tree kinds) (lambda () (shell "sleep 0.02")) timeout-ms)))))

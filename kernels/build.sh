@@ -28,7 +28,7 @@ build_one() {  # src extra-flags tag
   if [ ! -f "$so" ] || [ "$src" -nt "$so" ] || [ "$here/sink_abi.h" -nt "$so" ] || [ "$abi_h" -nt "$so" ]; then
     # shellcheck disable=SC2086
     "$CC" $CFLAGS $extra -std=c11 -Wall -Wextra -Werror -shared -fPIC -fvisibility=hidden \
-      -I"$here" -I"$AURA_LIB" -o "$so" "$src"
+      -I"$here" -I"$AURA_LIB" -Wl,-Bsymbolic -o "$so" "$src" -lm
     echo "built build/kernels/lib$name.so$tag"
   fi
 }
