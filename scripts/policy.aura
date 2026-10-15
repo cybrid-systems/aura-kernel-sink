@@ -1,8 +1,21 @@
-; scripts/policy.aura — run the profile-guided sink policy over every
-; f64vector fixture define and write a KEEP/ROLLBACK/ABORT/SKIP trajectory
-; (one JSON object per line) to $SINK_TRAJECTORY or build/trajectory.jsonl.
-; Threshold: the workspace (sink-min-speedup), overridable with
-; $SINK_MIN_SPEEDUP; Soft floor: $SINK_MIN_SOFT_US (default 50 us/call).
+; scripts/policy.aura — run the profile-guided sink policy over the f64vector
+; fixture defines and append one KEEP/ROLLBACK/ABORT/SKIP JSON line per
+; kernel to $SINK_TRAJECTORY (default build/trajectory.jsonl).
+;
+; Kernels: the six fixture defines on 5000-element vectors, plus two "short"
+; copies (vsum-short, vdot-short) on 128-element vectors, where the FFI +
+; guard overhead eats most of the gain, and vbad-mix (vkgen skips it).
+;
+; Knobs (env):
+;   SINK_MIN_SPEEDUP   default threshold (else the workspace (sink-min-speedup))
+;   SINK_MIN_SOFT_US   default Soft floor in us/call (50)
+;   SINK_PROPOSAL      JSON file from an outer loop (aura-loop):
+;     {"proposal": "id", "default_threshold": 4,
+;      "kernels": {"vsum": {"action": "sink"|"skip", "threshold": 5.2, "floor_us": 50}}}
+;     default_threshold is hot-swapped into the workspace policy define
+;     (mutate:rebind sink-min-speedup); per-kernel thresholds go straight to
+;     policy:sink!; action "skip" writes a SKIP row at stage "policy".
+;   SINK_ROUND         round number, copied into every row ("extra").
 ;   source scripts/env.sh; $AURA_BIN scripts/policy.aura
 (require "fixture" all:)
 (require "plant" all:)
@@ -11,15 +24,36 @@
 (require "std/ffi" all:)
 (require "std/process" all:)
 (require "std/hot-strategy" all:)
-
 (score:set-rounds! 3)  ; best of 3 timed rounds (shared box, ms timer)
+
 (define (env-or k d) (let ((v (getenv k))) (if (and (string? v) (> (string-length v) 0)) v d)))
 (define traj (env-or "SINK_TRAJECTORY" "build/trajectory.jsonl"))
-(define thr (let ((v (getenv "SINK_MIN_SPEEDUP"))) (if (and (string? v) (> (string-length v) 0)) (string->number v) #f)))
+(define env-thr (let ((v (getenv "SINK_MIN_SPEEDUP"))) (if (and (string? v) (> (string-length v) 0)) (string->number v) #f)))
 (define floor-us (string->number (env-or "SINK_MIN_SOFT_US" "50")))
+(define proposal
+  (let ((p (getenv "SINK_PROPOSAL")))
+    (if (and (string? p) (> (string-length p) 0) (string? (read-file p))) (json-parse (read-file p)) #f)))
+(define (prop-kernel name)
+  (if (and proposal (hash-has-key? proposal "kernels") (hash-has-key? (hash-ref proposal "kernels") name))
+      (hash-ref (hash-ref proposal "kernels") name) #f))
+(define (kget h key d) (if (and h (hash-has-key? h key)) (hash-ref h key) d))
+
 (define plant (plant:real))
-(set-code (fixture:vector-workspace-code))
+(define short-code
+  (string-append "(define sink-kernel-vsum-short 0)\n(define sink-kernel-vdot-short 0)\n"
+                 "(define vsum-short " (fixture:vector-body "vsum") ")\n"
+                 "(define vdot-short " (fixture:vector-body "vdot") ")\n"))
+(set-code (string-append (fixture:vector-workspace-code) short-code))
 (eval-current)
+
+; Default threshold hot-swapped into the workspace policy define.
+(define default-thr (if proposal (kget proposal "default_threshold" #f) env-thr))
+(if default-thr
+    (begin (mutate:rebind "sink-min-speedup" (string-append "(lambda () " (number->string default-thr) ")") "aura-loop:proposal")
+           (eval-current))
+    #f)
+(policy:set-extra! (list (cons "round" (string->number (env-or "SINK_ROUND" "0")))
+                         (cons "proposal" (if proposal (kget proposal "proposal" "") ""))))
 
 (define (mkvec n seed)
   (let ((v (make-f64vector n)))
@@ -27,18 +61,27 @@
       (if (< i n) (begin (f64vector-set! v i (- (* 0.1 (modulo (+ (* i 7919) seed) 1000)) 50.3)) (loop (+ i 1))) v))))
 (define va (mkvec 5000 17))
 (define vb (mkvec 5000 4242))
+(define sa (mkvec 128 5))
+(define sb (mkvec 128 77))
 (define vs (mkvec 10 3))
-(define cases (list 0 1 2 7 49 333 999 5000))
+(define cases (list 0 1 2 7 49 128))
 
-(define (run! name samples probe shadow)
-  (policy:print (policy:sink! plant name samples probe cases shadow 5000 10 floor-us thr traj)))
-(run! "vsum" (list va 5000) (lambda (k) (vsum va k)) (list (list va 0) (list va 5000) (list vs 10)))
-(run! "vdot" (list va vb 5000) (lambda (k) (vdot va vb k)) (list (list va vb 0) (list va vb 5000) (list vs vb 10)))
-(run! "vnorm2" (list va) (lambda (k) (vnorm2 va)) (list (list va) (list vs)))
-(run! "vscaled" (list va 0.5) (lambda (k) (vscaled va 0.5)) (list (list va 0.5) (list vs 2.5)))
-(run! "vcount-above" (list va 0.5) (lambda (k) (vcount-above va 0.5)) (list (list va 0.5) (list vs -1.0)))
-(run! "vmaxabs" (list va) (lambda (k) (vmaxabs va)) (list (list va) (list vs)))
-(run! "vbad-mix" (list va) (lambda (k) (vbad-mix va)) (list (list va)))
+(define (run! name samples probe shadow bench-arg reps)
+  (let* ((k (prop-kernel name))
+         (thr (kget k "threshold" #f))
+         (fl (kget k "floor_us" floor-us)))
+    (if (equal? (kget k "action" "sink") "skip")
+        (policy:print (policy:skip! name samples "learned-skip" thr fl traj))
+        (policy:print (policy:sink! plant name samples probe cases shadow bench-arg reps fl thr traj)))))
+(run! "vsum" (list va 5000) (lambda (k) (vsum va k)) (list (list va 0) (list va 5000) (list vs 10)) 5000 10)
+(run! "vdot" (list va vb 5000) (lambda (k) (vdot va vb k)) (list (list va vb 0) (list va vb 5000) (list vs vb 10)) 5000 10)
+(run! "vnorm2" (list va) (lambda (k) (vnorm2 va)) (list (list va) (list vs)) 0 10)
+(run! "vscaled" (list va 0.5) (lambda (k) (vscaled va 0.5)) (list (list va 0.5) (list vs 2.5)) 0 10)
+(run! "vcount-above" (list va 0.5) (lambda (k) (vcount-above va 0.5)) (list (list va 0.5) (list vs -1.0)) 0 10)
+(run! "vmaxabs" (list va) (lambda (k) (vmaxabs va)) (list (list va) (list vs)) 0 10)
+(run! "vsum-short" (list sa 128) (lambda (k) (vsum-short sa (if (> k 128) 128 k))) (list (list sa 0) (list sa 128) (list vs 10)) 128 150)
+(run! "vdot-short" (list sa sb 128) (lambda (k) (vdot-short sa sb (if (> k 128) 128 k))) (list (list sa sb 0) (list sa sb 128) (list vs sb 10)) 128 150)
+(run! "vbad-mix" (list va) (lambda (k) (vbad-mix va)) (list (list va)) 0 10)
 (define s (policy:summary traj))
 (display (string-append "trajectory " traj ": KEEP " (number->string (car s)) " ROLLBACK " (number->string (car (cdr s)))
                         " ABORT " (number->string (car (cdr (cdr s)))) " SKIP " (number->string (car (cdr (cdr (cdr s)))))))

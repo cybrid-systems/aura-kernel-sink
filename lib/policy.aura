@@ -26,7 +26,7 @@
 ; many c-func calls already, and those collide with low closure ids
 ; (aura#4532).
 
-(export policy:sink! policy:threshold policy:get policy:json policy:append!
+(export policy:sink! policy:skip! policy:features policy:set-extra! policy:threshold policy:get policy:json policy:append!
         policy:read policy:summary policy:print)
 
 (require "discover" all:)
@@ -99,13 +99,60 @@
           (loop (cdr rs) (if (equal? d "KEEP") (+ k 1) k) (if (equal? d "ROLLBACK") (+ r 1) r)
                 (if (equal? d "ABORT") (+ a 1) a) (if (equal? d "SKIP") (+ s 1) s))))))
 
+; ---- state features for aura-loop (kernel shape)
+; (arity nvec vec-len ops) where ops is a list of "head:count" strings: every
+; call head in the body (operators, f64vector-ref, sqrt, if, ...). Own walk
+; and own counting (no std closures, aura#4532).
+(define (pf-bump name acc)
+  (cond ((null? acc) (list (cons name 1)))
+        ((equal? (car (car acc)) name) (cons (cons name (+ 1 (cdr (car acc)))) (cdr acc)))
+        (else (cons (car acc) (pf-bump name (cdr acc))))))
+(define (pf-walk-list xs a) (if (null? xs) a (pf-walk-list (cdr xs) (pf-walk (car xs) a))))
+(define (pf-walk-binds bs a) (if (null? bs) a (pf-walk-binds (cdr bs) (if (pair? (car bs)) (pf-walk-list (cdr (car bs)) a) a))))
+(define (pf-walk t acc)
+  (cond ((not (pair? t)) acc)
+        ((not (string? (car t))) (pf-walk-list t acc))
+        ; (lambda params body...): params are not calls
+        ((equal? (car t) "lambda") (pf-walk-list (if (pair? (cdr t)) (cdr (cdr t)) (list)) (pf-bump "lambda" acc)))
+        ; (letrec|let|let* ((name val) ...) body...), and named let (let name (...) body...)
+        ((or (equal? (car t) "letrec") (equal? (car t) "let") (equal? (car t) "let*"))
+         (let ((rest (cdr t)) (a (pf-bump (car t) acc)))
+           (if (and (pair? rest) (string? (car rest)))
+               (pf-walk-list (cdr (cdr rest)) (pf-walk-binds (car (cdr rest)) a))
+               (if (pair? rest) (pf-walk-list (cdr rest) (pf-walk-binds (car rest) a)) a))))
+        (else (pf-walk-list (cdr t) (pf-bump (car t) acc)))))
+(define (pf-count-v ks n) (cond ((not ks) 0) ((null? ks) n) ((equal? (car ks) "V") (pf-count-v (cdr ks) (+ n 1))) (else (pf-count-v (cdr ks) n))))
+(define (pf-vlen xs) (cond ((null? xs) 0) ((string? (car xs)) (f64vector-length (car xs))) (else (pf-vlen (cdr xs)))))
+(define (policy:features tree samples kinds)
+  (let ((params (if (and (pair? tree) (pair? (cdr tree))) (car (cdr tree)) (list))))
+    (list (if (pair? params) (length params) 0)
+          (pf-count-v kinds 0)
+          (pf-vlen samples)
+          (let loop ((ops (if (and (pair? tree) (pair? (cdr tree)) (pair? (cdr (cdr tree)))) (pf-walk (car (cdr (cdr tree))) (list)) (list))) (acc (list)))
+            (if (null? ops) acc
+                (loop (cdr ops) (cons (string-append (car (car ops)) ":" (number->string (cdr (car ops)))) acc)))))))
+; JSON shape: encoded by pj-val as the list [arity, nvec, vec_len, [ops...]].
+(define (policy-feats-json f) (if f f (list)))
+
+(define policy-cur-feats #f)
+(define policy-cur-floor 0)
+(define policy-cur-action "sink")
+(define policy-extra (list))
+; Extra fields on every row (e.g. (("round" . 3) ("proposal" . "p3"))).
+(define (policy:set-extra! alist) (set! policy-extra alist) alist)
+
 (define (policy-row name decision stage reasons kinds so threshold speedup soft-us tb ta reps arg g0 rolled ok)
   (list (cons "ts" (current-time-ms)) (cons "name" name) (cons "decision" decision) (cons "stage" stage)
         (cons "reasons" reasons) (cons "kinds" (if kinds kinds (list))) (cons "so" so)
         (cons "threshold" threshold) (cons "speedup" speedup) (cons "soft_us_per_call" soft-us)
         (cons "t_before_ms" tb) (cons "t_after_ms" ta) (cons "reps" reps) (cons "bench_arg" arg)
         (cons "gen_before" g0) (cons "gen_after" (ast:generation))
-        (cons "rolled_back" rolled) (cons "rollback_ok" ok)))
+        (cons "rolled_back" rolled) (cons "rollback_ok" ok)
+        (cons "floor_us" policy-cur-floor) (cons "action" policy-cur-action)
+        (cons "features" (policy-feats-json policy-cur-feats))
+        (cons "extra" (pr-extra policy-extra))))
+(define (pr-extra xs) (if (null? xs) (list) (cons (car (car xs)) (cons (cdr (car xs)) (pr-extra (cdr xs))))))
+
 
 ; plant: a top-level bound (plant:real) (aura#4481). shadow: argument lists
 ; for the gate. probe/cases/bench-arg/reps: as for loop:sink-gated.
@@ -126,6 +173,9 @@
          (thr (policy:threshold threshold))
          (tree (watch:tree-of name (discover:defines (discover:scan)))))
     (set! policy-pinned (list plant samples probe cases shadow tree))
+    (set! policy-cur-floor min-soft-us)
+    (set! policy-cur-action "sink")
+    (set! policy-cur-feats (if tree (policy:features tree samples (vkgen:kinds tree samples)) #f))
     (if (not tree)
         (policy:append! path (policy-row name "SKIP" "discover" (list "no-define") #f "" thr 0.0 0.0 0 0 reps bench-arg g0 #f #t))
         (let* ((pn (if (< reps 4) 2 (quotient reps 2)))
@@ -152,6 +202,16 @@
                             (policy:append! path (policy-row name decision (loop:stage r) (loop:reasons r) kinds (bg:job-so job) thr
                                                              (loop:speedup r) soft-us (loop:t-before r) (loop:t-after r) reps bench-arg g0
                                                              (loop:rolled-back? r) (loop:rollback-ok? r)))))))))))))
+
+; A decision taken outside (aura-loop proposed "skip" for this kernel): one
+; SKIP row at stage "policy", nothing measured, nothing compiled.
+(define (policy:skip! name samples reason threshold min-soft-us path)
+  (let* ((thr (policy:threshold threshold))
+         (tree (watch:tree-of name (discover:defines (discover:scan)))))
+    (set! policy-cur-floor min-soft-us)
+    (set! policy-cur-action "skip")
+    (set! policy-cur-feats (if tree (policy:features tree samples (vkgen:kinds tree samples)) #f))
+    (policy:append! path (policy-row name "SKIP" "policy" (list reason) (if tree (vkgen:kinds tree samples) #f) "" thr 0.0 0.0 0 0 0 0 (ast:generation) #f #t))))
 
 (define (policy:print row)
   (display "  [policy] ") (display (policy:get row "name")) (display ": ")

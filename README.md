@@ -132,6 +132,8 @@ checks: 8 passed, 0 failed
 
 `scripts/policy.aura` 对所有 f64vector fixture 跑一遍，轨迹写到 `build/trajectory.jsonl`（`SINK_MIN_SPEEDUP`、`SINK_MIN_SOFT_US`、`SINK_TRAJECTORY` 可调）。阈值 2：KEEP 6、SKIP 1（vbad-mix），闭环实测加速 6.4×–14×（5000 元素，含 wrapper 开销）。阈值 10：vsum、vdot、vcount-above 被 ROLLBACK，vnorm2、vscaled、vmaxabs 保留。测试 `tests/test_policy.aura`（15 项）。
 
+**接 aura-loop**：每行还带 `features` 字段，格式为 `[arity, nvec, vec_len, [op:count …]]`，即 kernel 形状。op 统计的是函数体里的调用头，lambda 参数和 let 绑定名不算。另带 `floor_us`、`action`，以及 `extra`（`SINK_ROUND`、提案 id）。`SINK_PROPOSAL` 是 aura-loop 写的提案 JSON，`default_threshold` 用 `mutate:rebind sink-min-speedup` 热换进 workspace。每个 kernel 可以单独给 `threshold`、`floor_us`，或 `action: "skip"`；skip 由 `policy:skip!` 写一行 stage 为 `policy` 的 SKIP，不编译、不改 workspace。脚本里另有 128 元素的 `vsum-short`、`vdot-short`：这个规模下 FFI 拷贝和守卫开销占主导，下沉后反而只有 Soft 的约 0.3 倍速度，任何阈值都会 ROLLBACK，正适合让外层学出跳过下限。
+
 计时：`score:set-rounds!` 取多轮中最好的一轮，向量测试和策略用 3 轮。共享机器上毫秒级计时有抖动，单轮时偶尔会把 accept 翻成 too-slow。
 
 ### 值编码 ABI（单一来源）
@@ -269,6 +271,8 @@ Test `tests/test_bg.aura` (28 checks) covers: background build, gated accept, an
 The threshold is passed in. With `#f` it is read from the workspace policy define `(sink-min-speedup)`, so an outer loop can hot-swap it with `mutate:rebind`. Row fields: `ts name decision stage reasons kinds so threshold speedup soft_us_per_call t_before_ms t_after_ms reps bench_arg gen_before gen_after rolled_back rollback_ok`. `policy:read` reads the file back with `json-parse`, and `policy:summary` counts KEEP/ROLLBACK/ABORT/SKIP.
 
 `scripts/policy.aura` runs the policy over every f64vector fixture and writes `build/trajectory.jsonl` (tunable with `SINK_MIN_SPEEDUP`, `SINK_MIN_SOFT_US` and `SINK_TRAJECTORY`). At threshold 2 the result is KEEP 6 and SKIP 1 (vbad-mix), with closed-loop speedups of 6.4×–14× (5000 elements, wrapper overhead included). At threshold 10, vsum, vdot and vcount-above are ROLLBACK, while vnorm2, vscaled and vmaxabs are kept. Test: `tests/test_policy.aura` (15 checks).
+
+**aura-loop hookup**: every row also carries `features`, formatted as `[arity, nvec, vec_len, [op:count …]]` (the kernel shape; the op counts are the call heads in the body, not lambda params or let binding names), plus `floor_us`, `action` and `extra` (`SINK_ROUND`, proposal id). `SINK_PROPOSAL` is a JSON proposal written by aura-loop. Its `default_threshold` is hot-swapped into the workspace with `mutate:rebind sink-min-speedup`. Each kernel can get its own `threshold` and `floor_us`, or `action: "skip"`; a skip goes through `policy:skip!` and writes a SKIP row at stage `policy`, with no compile and no mutation. The script also has 128-element copies, `vsum-short` and `vdot-short`. At that size the FFI copy and guard overhead dominate, so the sunk version runs at only about 0.3× of Soft's speed and is a ROLLBACK at any threshold, which makes them the case where the outer loop has to learn a skip floor.
 
 Timing: `score:set-rounds!` takes the best of several timed rounds; the vector tests and the policy use 3. On a shared box a single ms-timer round occasionally flipped an accept to too-slow.
 

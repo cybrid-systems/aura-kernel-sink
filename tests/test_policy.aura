@@ -82,10 +82,25 @@
         (and (equal? (policy:get r5 "decision") "SKIP") (equal? (policy:get r5 "stage") "compile")
              (equal? (car (policy:get r5 "reasons")) "skipped")))
 
+; ---- 5b. features + extra fields + an externally decided skip
+(define (has? xs x) (cond ((null? xs) #f) ((equal? (car xs) x) #t) (else (has? (cdr xs) x))))
+(define f1 (policy:get r1 "features"))
+(expect "features: vsum arity 2, 1 vector, length 5000, op mix"
+        (and (= (car f1) 2) (= (car (cdr f1)) 1) (= (car (cdr (cdr f1))) 5000)
+             (has? (car (cdr (cdr (cdr f1)))) "f64vector-ref:1") (has? (car (cdr (cdr (cdr f1)))) "+:2")
+             (not (has? (car (cdr (cdr (cdr f1)))) "i:1"))))
+(policy:set-extra! (list (cons "round" 7)))
+(define r6 (policy:skip! "vmaxabs" (list va) "learned-skip" #f 50 traj))
+(policy:print r6)
+(expect "skip!: SKIP at stage policy, action skip, round tag, no mutation"
+        (and (equal? (policy:get r6 "decision") "SKIP") (equal? (policy:get r6 "stage") "policy")
+             (equal? (policy:get r6 "action") "skip") (equal? (policy:get r6 "extra") (list "round" 7))
+             (= (policy:get r6 "gen_before") (policy:get r6 "gen_after"))))
+
 ; ---- 6. the trajectory: one JSON line per decision, read back with json-parse
 (define rows (policy:read traj))
-(expect "trajectory: 5 JSON lines" (= (length rows) 5))
-(expect "trajectory: summary KEEP 2, ROLLBACK 1, ABORT 0, SKIP 2" (equal? (policy:summary traj) (list 2 1 0 2)))
+(expect "trajectory: 6 JSON lines" (= (length rows) 6))
+(expect "trajectory: summary KEEP 2, ROLLBACK 1, ABORT 0, SKIP 3" (equal? (policy:summary traj) (list 2 1 0 3)))
 (expect "trajectory: fields round-trip (name, decision, kinds, threshold)"
         (let ((h (car rows)))
           (and (equal? (hash-ref h "name") "vsum") (equal? (hash-ref h "decision") "KEEP")
