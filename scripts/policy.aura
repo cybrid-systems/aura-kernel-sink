@@ -24,9 +24,9 @@
 (require "std/ffi" all:)
 (require "std/process" all:)
 (require "std/hot-strategy" all:)
-(score:set-rounds! 3)  ; best of 3 timed rounds (shared box, ms timer)
 
 (define (env-or k d) (let ((v (getenv k))) (if (and (string? v) (> (string-length v) 0)) v d)))
+(score:set-rounds! (string->number (env-or "SINK_SCORE_ROUNDS" "3")))  ; best of N (default 3) timed rounds (shared box, ms timer)
 (define traj (env-or "SINK_TRAJECTORY" "build/trajectory.jsonl"))
 (define env-thr (let ((v (getenv "SINK_MIN_SPEEDUP"))) (if (and (string? v) (> (string-length v) 0)) (string->number v) #f)))
 (define floor-us (string->number (env-or "SINK_MIN_SOFT_US" "50")))
@@ -66,7 +66,13 @@
 (define vs (mkvec 10 3))
 (define cases (list 0 1 2 7 49 128))
 
+; SINK_ONLY=<name>: run just that kernel (scripts/policy_all.sh runs one
+; process per kernel: c-func ids pile up across sinks in one process and
+; collide with closure ids, aura#4532; RSS reached 13 GB by the 8th sink).
+(define only (env-or "SINK_ONLY" ""))
 (define (run! name samples probe shadow bench-arg reps)
+  (if (or (equal? only "") (equal? only name)) (run-one! name samples probe shadow bench-arg reps) #f))
+(define (run-one! name samples probe shadow bench-arg reps)
   (let* ((k (prop-kernel name))
          (thr (kget k "threshold" #f))
          (fl (kget k "floor_us" floor-us)))
@@ -79,10 +85,10 @@
 (run! "vscaled" (list va 0.5) (lambda (k) (vscaled va 0.5)) (list (list va 0.5) (list vs 2.5)) 0 10)
 (run! "vcount-above" (list va 0.5) (lambda (k) (vcount-above va 0.5)) (list (list va 0.5) (list vs -1.0)) 0 10)
 (run! "vmaxabs" (list va) (lambda (k) (vmaxabs va)) (list (list va) (list vs)) 0 10)
-(run! "vsum-short" (list sa 128) (lambda (k) (vsum-short sa (if (> k 128) 128 k))) (list (list sa 0) (list sa 128) (list vs 10)) 128 150)
-(run! "vdot-short" (list sa sb 128) (lambda (k) (vdot-short sa sb (if (> k 128) 128 k))) (list (list sa sb 0) (list sa sb 128) (list vs sb 10)) 128 150)
+(run! "vsum-short" (list sa 128) (lambda (k) (vsum-short sa (if (> k 128) 128 k))) (list (list sa 0) (list sa 128) (list vs 10)) 128 40)
+(run! "vdot-short" (list sa sb 128) (lambda (k) (vdot-short sa sb (if (> k 128) 128 k))) (list (list sa sb 0) (list sa sb 128) (list vs sb 10)) 128 40)
 (run! "vbad-mix" (list va) (lambda (k) (vbad-mix va)) (list (list va)) 0 10)
-(define s (policy:summary traj))
-(display (string-append "trajectory " traj ": KEEP " (number->string (car s)) " ROLLBACK " (number->string (car (cdr s)))
-                        " ABORT " (number->string (car (cdr (cdr s)))) " SKIP " (number->string (car (cdr (cdr (cdr s)))))))
+(define s (if (equal? only "") (policy:summary traj) (list 0 0 0 0)))
+(if (equal? only "") (display (string-append "trajectory " traj ": KEEP " (number->string (car s)) " ROLLBACK " (number->string (car (cdr s)))
+                        " ABORT " (number->string (car (cdr (cdr s)))) " SKIP " (number->string (car (cdr (cdr (cdr s))))))) #f)
 (newline)
