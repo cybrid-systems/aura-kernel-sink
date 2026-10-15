@@ -44,7 +44,12 @@
                   (if (and got (equal? (car got) want)) bad (+ bad 1))))))))
 
 ; Total milliseconds for reps calls of (probe arg).
+; Warm-up first (untimed, reps/4 + 1 calls): right after eval-current the
+; first calls of a rebound define pay for re-lowering / tier-up, which used to
+; count against the kernel (vdot measured 0.42 ms/call in the loop, 0.095
+; warm). Both sides are warmed the same way.
 (define (score:bench probe arg reps)
+  (let warm ((i 0)) (if (< i (+ 1 (quotient reps 4))) (begin (probe arg) (warm (+ i 1))) 0))
   (let ((t0 (current-time-ms)))
     (let loop ((i 0))
       (if (< i reps)

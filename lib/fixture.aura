@@ -17,7 +17,8 @@
 ; workload run (no hard-coded profile any more). ms-per-call is measured;
 ; static call sites come from (query:calls name).
 
-(export fixture:overflow-src fixture:overflow-names fixture:workspace-code
+(export fixture:vector-workspace-code fixture:vector-src fixture:vector-names fixture:vector-body
+        fixture:overflow-src fixture:overflow-names fixture:workspace-code
         fixture:float-workspace-code
         fixture:float-literal-src
         fixture:kind
@@ -258,3 +259,30 @@
     (else
      (sink-plan:make name (fixture:so "sum_sq") "sink_sum_sq" 1
                      (fixture:aura-body name) (fixture-fake name "good")))))
+
+;; f64vector kernels (lib/vkgen.aura). Workspace defines over f64vectors; the
+;; vector data itself lives in the host file (tests/test_vkgen.aura).
+(define (fixture:vector-names) (list "vsum" "vdot" "vnorm2" "vscaled" "vcount-above" "vmaxabs" "vbad-mix"))
+(define (fixture:vector-body name)
+  (cond
+    ((string=? name "vsum") "(lambda (v n) (let loop ((i 0) (s 0.0)) (if (< i n) (loop (+ i 1) (+ s (f64vector-ref v i))) s)))")
+    ((string=? name "vdot") "(lambda (a b n) (let loop ((i 0) (s 0.0)) (if (< i n) (loop (+ i 1) (+ s (* (f64vector-ref a i) (f64vector-ref b i)))) s)))")
+    ((string=? name "vnorm2") "(lambda (v) (let loop ((i 0) (s 0.0)) (if (< i (f64vector-length v)) (loop (+ i 1) (+ s (* (f64vector-ref v i) (f64vector-ref v i)))) (sqrt s))))")
+    ((string=? name "vscaled") "(lambda (v k) (let loop ((i 0) (s 0.0)) (if (< i (f64vector-length v)) (loop (+ i 1) (+ s (* k (f64vector-ref v i)))) s)))")
+    ((string=? name "vcount-above") "(lambda (v t) (let loop ((i 0) (c 0)) (if (< i (f64vector-length v)) (loop (+ i 1) (if (> (f64vector-ref v i) t) (+ c 1) c)) c)))")
+    ((string=? name "vmaxabs") "(lambda (v) (let loop ((i 0) (m 0.0)) (if (< i (f64vector-length v)) (loop (+ i 1) (max m (abs (f64vector-ref v i)))) m)))")
+    ; Int accumulator that turns Float on the back edge: Aura returns Int 0 for
+    ; an empty vector, so no single C type is right -> skipped with a reason.
+    ((string=? name "vbad-mix") "(lambda (v) (let loop ((i 0) (s 0)) (if (< i (f64vector-length v)) (loop (+ i 1) (+ s (f64vector-ref v i))) s)))")
+    ; Wrong kernel source for the rollback test (off by one: skips v[0]).
+    ((string=? name "vsum-wrong") "(lambda (v n) (let loop ((i 1) (s 0.0)) (if (< i n) (loop (+ i 1) (+ s (f64vector-ref v i))) s)))")
+    (else "")))
+(define (fixture-vdefs names)
+  (if (null? names) ""
+      (string-append "(define sink-kernel-" (car names) " 0)\n(define " (car names) " " (fixture:vector-body (car names)) ")\n"
+                     (fixture-vdefs (cdr names)))))
+(define (fixture:vector-workspace-code)
+  (string-append (fixture-vdefs (fixture:vector-names)) "(define (sink-min-speedup) 2)\n"))
+; Host-side source of the wrong kernel (not a workspace define).
+(define (fixture:vector-src)
+  (string-append "(define vsum-wrong " (fixture:vector-body "vsum-wrong") ")"))

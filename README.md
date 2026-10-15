@@ -94,6 +94,23 @@ checks: 8 passed, 0 failed
 
 **Float kernel**：`kgen:compile-float`（或 `kgen:compile-kind name tree "Float"`）用同一子集生成 `double` 代码：浮点字面量原样保留为 C double，整数字面量变成 `(N.0)`，参数/循环变量/返回值都是 `double`，签名 `(Float ...) -> Float`。类型由 discover 决定：静态上用小整数调用返回整数就是 Int，否则用小浮点调用返回浮点就是 Float；没有浮点字面量的数值函数（如 `hot-fsum`）两者都满足，先当 Int，再靠**活类型反馈**：计数包装同时把首参写进 `sink-argf`，活负载跑完后 `discover:retype!` 把首参是浮点的候选改成 Float。`fixture:float-workspace-code` 是第二个工作区（`hot-fsum`/`cold-add`/`label-of`，与 Int 工作区分开以免超过 8 个过程，#4479）；MVP 第 5 步在里面走完 发现 → 类型反馈 → identify → 生成 double kernel → 闭环，实测约 29–41×，与 Aura 逐位相等。字符串/布尔/除法/调用其他函数在 Float 下同样带原因跳过；Int 路径不变。限制：工作区过程体里的浮点字面量仍读成 0（#4475），所以工作区里的 Float 候选不能写浮点常量（带字面量的 `fpoly` 只在宿主文件里对拍）；Aura 里 `n<=0` 时返回整数 0 而 kernel 返回 0.0，所以 `hot-fsum` 用 `(- h h)` 起步。
 
+### f64vector kernel（`lib/vkgen.aura`）
+
+针对 Aura #4503 的 `f64vector`（连续存放、不装箱的 double），`vkgen` 把遍历向量的循环 define 生成为紧凑的 C 循环。参数种类由 `vkgen:kinds` 决定：在 `f64vector-ref`/`f64vector-length` 里当向量用的参数是 V，其余参数按实际调用值定为 I（精确整数）或 F（Float）。表达式按类型生成，Int/Float 混合运算和 Aura 一样按左折叠规则提升；Int 运算全部带溢出检查；每次 `f64vector-ref` 都做越界检查，越界时置状态位 4，wrapper 抛 Aura 错误（fail closed）。支持的形式有 `+ - * /`、`quotient/remainder/modulo`、`sqrt abs min max exact->inexact`、`if`、比较、`and/or/not`，以及 named let / 自尾递归。如果循环变量在回边上会从 Int 变成 Float，就跳过不生成：循环一次都不执行时 Aura 返回的是 Int，不存在一个对所有情况都正确的 C 类型。编译不加 `-ffast-math`，累加顺序和 Aura 相同，Float 结果逐位相等。
+
+调用约定绕开了 aura#4531（`c-func` 的混合签名会走错调用约定）：向量按 String 参数传入，紧跟它的长度（Int）；Float 标量打包进每次调用新分配的 aux f64vector，所以签名里从不出现 Float 参数。Float 返回值另外导出 `<sym>_bits` 版本，按 long 返回 double 的位模式；绑定时用 `aura_sink_f64ret_probe` 探测一次，决定用哪个版本。wrapper 带类型守卫，参数类型不符（比如 Float 的 n、Int 的 k）时退回原来的 Aura body（deopt），结果和下沉前一致。
+
+测试：`tests/test_vkgen.aura`、`tests/test_vkgen_more.aura`。这两个文件分开跑，因为 aura#4532：每次 `c-func` 都会占用一个 FFI id，id 多了会和闭包 id 冲突。闭环全部 accept，含错误 kernel 的 reject + heal。基准 `scripts/bench_vec.aura`（ms/次，Soft 指 workspace define 本身）：
+
+| | Soft | 下沉后 | 裸 c-func | 原生 `f64vector-dot` |
+|---|---|---|---|---|
+| dot n=1000 | 1.03 | 0.075（13.7×） | 0.015 | 0.015 |
+| sum n=1000 | 0.675 | 0.06（11.3×） | 0.02 | – |
+| dot n=100000 | 119.3 | 0.4（298×） | 0.2 | 0.1 |
+| sum n=100000 | 61.6 | 0.3（205×） | 0.1 | – |
+
+下沉后和裸 c-func 之间的差距，是 wrapper 的守卫开销加上 String 参数的整段拷贝（aura#4531 里提了零拷贝借用槽位的需求）。
+
 ### 值编码 ABI（单一来源）
 
 `kernels/sink_abi.h` 不再自己写编码常量，而是直接包含 Aura 的 `lib/aura_value_abi.h`（aura#4502，ABI 4）：`kernels/build.sh` 加 `-I$AURA_LIB`，该头文件变化时重编所有 kernel；fixnum 范围取自 `AURA_FIXNUM_MIN/MAX`，低于 ABI 4 直接 `#error`。每个 kernel 导出 `aura_sink_value_abi()`，`plant:real` 在 `c-load` 后、任何 mutation 之前检查它，不匹配就在 load 阶段拒绝（`kernels/stale_abi.c` 对应测试）。
@@ -191,6 +208,23 @@ No hand-written candidate list: `discover:scan` reads `(query:code)`, keeps top-
 **Checked remainder / modulo.** Int `(remainder a b)` and `(modulo a b)` compile to `sink_ck_rem` / `sink_ck_mod` (kernels/sink_abi.h). `remainder` truncates and takes the sign of the dividend, like C99 `%`: `(remainder -7 2)` = -1. `modulo` matches what the pinned Aura Soft actually returns: `r = a % b; if (r < 0) r += |b|`, a non-negative result, so `(modulo 7 -2)` = 1 rather than the R7RS floor modulo -1. That is an Aura bug (#4486); the kernel copies it so a sunk define never changes answers, and `-DAURA_SINK_MODULO_FLOOR=1` switches to floor semantics once Aura is fixed. The divisor is tested before any `%` runs: `b == 0` sets status bit 2 (div0) and returns 0, the same exit and wrapper error (`sink: int overflow/div0 ...`) as quotient. `b == -1` returns 0 without executing `%`, so `INT64_MIN % -1` (UB in C) never runs. Within the fixnum range `-2^62 % -1` is 0 and Soft returns 0 too, so there is nothing to fail closed on: the kernel matches Soft instead. An operand outside the fixnum range (only possible from a non-Aura caller) sets bit 1. `|r| < |b|`, so results cannot overflow. `tests/test_kgen_remmod.aura` (17 checks) covers all 18 sign combinations for both ops against Aura, edges at 2^62-1, -2^62 and -2^52, MIN % -1, a gcd tail loop, Soft's catchable div0, kernel div0 → status 2, per-call clearing, and the checked wrapper.
 
 **Float kernels.** `kgen:compile-float` emits the same subset as `double` C: float literals stay C doubles, integer literals become `(N.0)`, signature `(Float ...) -> Float`. discover picks the kind: Int when small integer arguments return an integer, Float when only small float arguments return a float. A numeric body without float literals (`hot-fsum`) is both, so it starts as Int and is promoted by **live type feedback**: the counting wrapper also stores its first argument in `sink-argf`, and `discover:retype!` turns a candidate whose live calls pass a float into Float. `fixture:float-workspace-code` is a second workspace (kept apart from the Int one, aura#4479); MVP step 5 runs discover -> type feedback -> identify -> generated double kernel -> closed loop there (~29-41x, bit-equal to Aura). Workspace Float candidates cannot use float literals yet (aura#4475: they read back as 0), so the literal case (`fpoly`) is checked against a host-file define.
+
+### f64vector kernels (`lib/vkgen.aura`)
+
+For Aura's #4503 `f64vector` (contiguous unboxed doubles), `vkgen` turns loop defines over vectors into tight C loops. `vkgen:kinds` assigns parameter kinds: a parameter used as a vector in `f64vector-ref`/`f64vector-length` is V, and the rest are I (exact Int) or F (Float) according to the live sample arguments. Expressions are typed, and mixed Int/Float arithmetic promotes along Aura's left fold. Int ops are overflow-checked. Every `f64vector-ref` is bounds-checked; out of range sets status bit 4 and the wrapper raises an Aura error (fail closed). Supported: `+ - * /`, `quotient/remainder/modulo`, `sqrt abs min max exact->inexact`, `if`, comparisons, `and/or/not`, named let and self tail calls. A loop variable that would switch between Int and Float on the back edge is a skip, because Aura returns the entry type when the loop does not run, so no single C type is right. No `-ffast-math`: summation order is Aura's, so Float results are bit-equal.
+
+The calling convention works around aura#4531 (mixed `c-func` signatures use the wrong convention). A vector is a String arg followed by its length as an Int arg. Float scalars go in an aux f64vector allocated per call, so no Float arg is ever declared. A Float result is also exported as `<sym>_bits`, which returns the double's bit pattern as a long; `aura_sink_f64ret_probe` is called once to pick the version. The wrapper has type guards: arguments that don't fit (a Float n, an Int k) fall back to the original Aura body (deopt), so answers stay the same.
+
+Tests: `tests/test_vkgen.aura` and `tests/test_vkgen_more.aura`. They are split into two files because of aura#4532: every `c-func` takes an FFI id, and enough of them collide with closure ids. Every closed-loop attempt is accepted, and a wrong kernel is rejected and healed. Benchmark `scripts/bench_vec.aura` (ms/call; Soft = the workspace define itself):
+
+| | Soft | sunk | raw c-func | native `f64vector-dot` |
+|---|---|---|---|---|
+| dot n=1000 | 1.03 | 0.075 (13.7x) | 0.015 | 0.015 |
+| sum n=1000 | 0.675 | 0.06 (11.3x) | 0.02 | – |
+| dot n=100000 | 119.3 | 0.4 (298x) | 0.2 | 0.1 |
+| sum n=100000 | 61.6 | 0.3 (205x) | 0.1 | – |
+
+The gap between sunk and raw c-func is the wrapper's guards plus the full copy of each String arg (aura#4531 also asks for a zero-copy borrowed slot).
 
 ### Value ABI (single source)
 

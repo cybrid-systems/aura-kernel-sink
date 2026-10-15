@@ -30,3 +30,21 @@
 (define orows (kgen:emit! (discover:defines (discover:read (fixture:overflow-src))) (fixture:overflow-names) dir))
 (display "== kgen: overflow fixtures -> build/gen/*.c") (newline)
 (kgen:print orows)
+; f64vector kernels (lib/vkgen.aura, tests/test_vkgen.aura). Kinds from live
+; sample arguments (vkgen:kinds), the vector data never enters the workspace.
+(require "vkgen" all:)
+(set-code (fixture:vector-workspace-code))
+(eval-current)
+(define vdefs (discover:defines (discover:scan)))
+(define sv (make-f64vector 4 1.5))
+(define (vk-entry name samples) (list name (vkgen:kinds (car (cdr (assoc name vdefs))) samples)))
+(define ventries
+  (list (vk-entry "vsum" (list sv 4)) (vk-entry "vdot" (list sv sv 4)) (vk-entry "vnorm2" (list sv))
+        (vk-entry "vscaled" (list sv 0.5)) (vk-entry "vcount-above" (list sv 0.5)) (vk-entry "vmaxabs" (list sv))
+        (vk-entry "vbad-mix" (list sv))))
+(display "== vkgen: f64vector workspace -> build/gen/vgen_*.c") (newline)
+(vkgen:print (vkgen:emit! vdefs ventries dir))
+(set-code (fixture:vector-src))
+(eval-current)
+(define wdefs (discover:defines (discover:scan)))
+(vkgen:print (vkgen:emit! wdefs (list (list "vsum-wrong" (list "V" "I"))) dir))

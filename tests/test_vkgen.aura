@@ -1,0 +1,123 @@
+; tests/test_vkgen.aura — f64vector kernels (lib/vkgen.aura, aura#4503):
+; typed generation + skip reasons, kernels bit-equal to the Aura bodies,
+; fail-closed bounds, deopt on argument types, and the closed loop (accept
+; with a speedup, reject + heal a wrong kernel).
+; run_tests.sh runs scripts/gen_kernel.sh first (build/kernels/libvgen_*.so).
+(require "expect" all:)
+(require "fixture" all:)
+(require "discover" all:)
+(require "vkgen" all:)
+(require "sink_plan" all:)
+(require "plant" all:)
+(require "loop" all:)
+(require "std/ffi" all:)
+(require "std/hot-strategy" all:)
+(display "RUN-ONCE") (newline)
+
+(define plant (plant:real))
+(define (has-sub? s sub)
+  (let ((n (string-length s)) (m (string-length sub)))
+    (let loop ((i 0)) (cond ((> (+ i m) n) #f) ((string=? (substring s i (+ i m)) sub) #t) (else (loop (+ i 1)))))))
+
+(set-code (fixture:vector-workspace-code))
+(eval-current)
+(define defs (discover:defines (discover:scan)))
+; Own lookup, not std assoc: after ~N c-func calls, low-id std closures
+; (assoc, delete, iota) dispatch into the last C function (aura#4532).
+(define (tree name) (let f ((ds defs)) (if (string=? (car (car ds)) name) (car (cdr (car ds))) (f (cdr ds)))))
+(define (my-map f xs) (if (null? xs) (list) (cons (f (car xs)) (my-map f (cdr xs)))))
+
+; ---- data (host side): deterministic, mixed signs, inexact decimals
+(define (mkvec n seed)
+  (let ((v (make-f64vector n)))
+    (let loop ((i 0))
+      (if (< i n)
+          (begin (f64vector-set! v i (- (* 0.1 (modulo (+ (* i 7919) seed) 1000)) 50.3)) (loop (+ i 1)))
+          v))))
+(define va (mkvec 5000 17))
+(define vb (mkvec 5000 4242))
+(define vsmall (mkvec 10 3))
+(define vempty (make-f64vector 0))
+
+; ---- static: kinds + generation + skip reasons
+(expect "kinds: vsum (v n) -> V I" (equal? (vkgen:kinds (tree "vsum") (list va 3)) (list "V" "I")))
+(expect "kinds: vscaled (v k) with float k -> V F" (equal? (vkgen:kinds (tree "vscaled") (list va 0.5)) (list "V" "F")))
+(expect "kinds: non-vector sample for a vector param -> #f" (equal? (vkgen:kinds (tree "vsum") (list 3 3)) #f))
+(expect "vector params: vdot -> (a b)" (equal? (vkgen:vector-params (tree "vdot")) (list "a" "b")))
+(define g-dot (vkgen:compile "vdot" (tree "vdot") (list "V" "V" "I")))
+(expect "vdot: generated, Float result" (and (car g-dot) (equal? (car (cdr (cdr g-dot))) "F")))
+(expect "vdot: C signature (2 vectors, Int n, aux)"
+        (has-sub? (car (cdr g-dot)) "double sink_vgen_vdot(const char *v0, long n0, const char *v1, long n1, long a2)"))
+(expect "vdot: bounds-checked loads + bits twin + status export"
+        (and (has-sub? (car (cdr g-dot)) "sink_vref(v0, n0, ") (has-sub? (car (cdr g-dot)) "sink_vgen_vdot_bits(")
+             (has-sub? (car (cdr g-dot)) "AURA_SINK_OVF_STATUS(sink_vgen_vdot)")))
+(expect "vdot: c-func sig" (and (equal? (vkgen:sig (list "V" "V" "I") "F") "(String Int String Int Int) -> Float") (equal? (vkgen:sig (list "V" "F") "I") "(String Int String) -> Int")))
+(expect "vcount-above: Int result, Float threshold from aux"
+        (let ((g (vkgen:compile "vcount-above" (tree "vcount-above") (list "V" "F"))))
+          (and (car g) (equal? (car (cdr (cdr g))) "I") (has-sub? (car (cdr g)) "double l0_1 = sink_aux(aux, 0);"))))
+(expect "vbad-mix: skipped (Int accumulator turns Float on the back edge)"
+        (let ((g (vkgen:compile "vbad-mix" (tree "vbad-mix") (list "V")))) (and (not (car g)) (has-sub? (car (cdr g)) "back edge"))))
+(expect "no vector param: skipped (kgen's job)"
+        (not (car (vkgen:compile "s" (car (cdr (car (discover:defines (discover:read "(define s (lambda (n) (+ n 1)))"))))) (list "I")))))
+(expect "Float index: skipped"
+        (not (car (vkgen:compile "fi" (car (cdr (car (discover:defines (discover:read "(define fi (lambda (v x) (f64vector-ref v x)))"))))) (list "V" "F")))))
+
+; ---- golden: every sunk define is bit-equal to its Aura body
+(define names (list "vsum" "vdot" "vnorm2"))
+(define (kinds-of name) (vkgen:kinds (tree name) (cond ((string=? name "vsum") (list va 3)) ((string=? name "vdot") (list va vb 3))
+                                                      ((or (string=? name "vscaled") (string=? name "vcount-above")) (list va 0.5))
+                                                      (else (list va)))))
+(define (ret-of name) (car (cdr (cdr (vkgen:compile name (tree name) (kinds-of name))))))
+(define (plan-of name so-name)
+  (let ((kinds (kinds-of name)) (sym (vkgen:symbol so-name)) (ret (ret-of name)))
+    (sink-plan:make-custom name (fixture:so (vkgen:base so-name)) sym (vkgen:sig kinds ret) (length kinds)
+                           (fixture:vector-body name)
+                           (lambda (lib) (vkgen:bind-body name sym kinds ret lib (fixture:vector-body name))))))
+; probe: case k -> one call on the shared data
+(define (probe-of name)
+  (cond ((string=? name "vsum") (lambda (k) (vsum va k)))
+        ((string=? name "vdot") (lambda (k) (vdot va vb k)))
+        ((string=? name "vnorm2") (lambda (k) (vnorm2 (if (= k 0) vempty (if (< k 50) vsmall va)))))
+        ((string=? name "vscaled") (lambda (k) (vscaled va (* 0.001 k))))
+        ((string=? name "vcount-above") (lambda (k) (vcount-above va (- (* 0.1 k) 30.0))))
+        (else (lambda (k) (vmaxabs (if (= k 0) vempty (if (< k 50) vsmall va)))))))
+(define cases (list 0 1 2 7 49 333 999 5000))
+
+; Plans built before any sink (aura#4532: no std closure after the c-funcs).
+(define plans (my-map (lambda (n) (list n (plan-of n n))) names))
+(define wrong-plan (plan-of "vsum" "vsum-wrong"))
+(define (plan-named name) (let f ((ps plans)) (if (string=? (car (car ps)) name) (car (cdr (car ps))) (f (cdr ps)))))
+(define vsum-ref (eval (fixture:vector-body "vsum")))
+(define vscaled-ref (eval (fixture:vector-body "vscaled")))
+(define vsum-golden (my-map (lambda (k) (vsum-ref va k)) cases))
+
+(define results (list))
+(define (attempt! name)
+  (let ((r (loop:sink-one (plan-named name) plant (probe-of name) cases 5000 10 (sink-min-speedup))))
+    (loop:print r)
+    (set! results (cons r results))
+    r))
+(define r #f)
+(set! r (attempt! "vsum"))
+(expect "loop vsum: accepted" (loop:accepted? r))
+(expect "loop vsum: speedup >= 2" (>= (loop:speedup r) 2))
+(expect "sunk vsum: slot is a kernel closure" (procedure? sink-kernel-vsum))
+(expect "sunk vsum: bit-equal on all cases" (equal? (my-map (probe-of "vsum") cases) vsum-golden))
+(set! r (attempt! "vdot"))
+(expect "loop vdot: accepted" (loop:accepted? r))
+(set! r (attempt! "vnorm2"))
+(expect "loop vnorm2: accepted (sqrt, f64vector-length, empty vector)" (loop:accepted? r))
+; ---- fail closed + deopt
+(expect "bounds: (vsum vsmall 100) raises an Aura error, like Soft"
+        (equal? (try (vsum vsmall 100) (catch (e) "err")) "err"))
+(expect "bounds: kernel usable after the error" (equal? (vsum vsmall 10) (vsum-ref vsmall 10)))
+(expect "deopt: Float n falls back to the Aura body (same answer)"
+        (equal? (vsum va 5.0) (vsum-ref va 5.0)))
+
+; ---- wrong kernel: rejected and healed back to the sunk version
+(set! r (loop:sink-one wrong-plan plant (probe-of "vsum") cases 5000 10 (sink-min-speedup)))
+(loop:print r)
+(expect "loop vsum-wrong: rejected (wrong-result)" (and (not (loop:accepted? r)) (equal? (loop:reasons r) (list "wrong-result"))))
+(expect "loop vsum-wrong: healed, golden re-checked" (loop:rollback-ok? r))
+(expect "loop vsum-wrong: still correct afterwards" (equal? (vsum va 5000) (vsum-ref va 5000)))
+(expect "checks all passed" (expect-summary))

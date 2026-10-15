@@ -46,9 +46,15 @@
 #define AURA_SINK_EMIT_VERSION 0
 #endif
 
+/* aura_sink_f64ret_probe: a double-returning function the sink calls as
+ * "(Int) -> Float" at bind time. (probe 3) = 1.75 means c-func reads a Float
+ * result from xmm0 (the C ABI); anything else means it still reads rax
+ * (aura#4531) and Float-returning vector kernels are bound through their
+ * <sym>_bits twin, which returns the double's bit pattern as a long. */
 #define AURA_SINK_MODULE \
   __attribute__((visibility("default"))) const uint64_t aot_emit_version = AURA_SINK_EMIT_VERSION; \
-  __attribute__((visibility("default"))) long aura_sink_value_abi(void) { return AURA_SINK_VALUE_ABI; }
+  __attribute__((visibility("default"))) long aura_sink_value_abi(void) { return AURA_SINK_VALUE_ABI; } \
+  __attribute__((visibility("default"))) double aura_sink_f64ret_probe(long a) { return (double)a * 0.5 + 0.25; }
 
 #define AURA_SINK_EXPORT __attribute__((visibility("default")))
 
@@ -127,6 +133,30 @@ static inline int64_t sink_ck_mod(int64_t a, int64_t b, int *ovf) {
  * (AURA_FIXNUM_MIN/MAX), so every in-range kernel result crosses c-func as an
  * exact Int. The guard is just the overflow flag. */
 static inline int sink_ck_ret(int64_t r, int ovf) { (void)r; return ovf; }
+
+/* ---- f64vector kernels (lib/vkgen.aura) --------------------------------
+ * An f64vector crosses c-func as a String arg: a pointer to a COPY of the
+ * slot's 8*n little-endian doubles (read-only, aura#4531). Lengths and Float
+ * scalars come in one packed aux f64vector built by the Aura wrapper:
+ *   aux[0..nv-1] = lengths of the vector params, aux[nv..] = Float params.
+ * Status bits (beyond 1 overflow / 2 div0): 4 index out of range. Every
+ * kernel stops at the first set bit (fail closed). */
+#include <string.h>
+static inline double sink_aux(const char *aux, int k) {
+  double d; memcpy(&d, aux + 8 * (long)k, 8); return d;
+}
+static inline double sink_vref(const char *p, int64_t n, int64_t i, int *ovf) {
+  if (i < 0 || i >= n) { *ovf |= 4; return 0.0; }
+  double d; memcpy(&d, p + 8 * i, 8); return d;
+}
+/* (sqrt x) of a negative Float is nan in Aura Soft, the same as C. */
+static inline double sink_vsqrt(double x) { return __builtin_sqrt(x); }
+static inline int64_t sink_ck_abs(int64_t a, int *ovf) { return a < 0 ? sink_ck_neg(a, ovf) : a; }
+static inline int64_t sink_imax(int64_t a, int64_t b) { return a > b ? a : b; }
+static inline int64_t sink_imin(int64_t a, int64_t b) { return a < b ? a : b; }
+static inline double sink_fmax(double a, double b) { return a > b ? a : b; }
+static inline double sink_fmin(double a, double b) { return a < b ? a : b; }
+static inline long sink_f64_bits(double d) { long r; memcpy(&r, &d, 8); return r; }
 
 /* Per-kernel status (thread-local; read-and-clear accessor): 0 ok, bit 1 = overflow, bit 2 = div0. */
 #define AURA_SINK_OVF_DECL(sym) static _Thread_local long sym##_ovf_;

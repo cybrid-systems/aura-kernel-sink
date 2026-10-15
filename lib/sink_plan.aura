@@ -13,6 +13,8 @@
 
 (export sink-plan:make
         sink-plan:make-kind
+        sink-plan:make-custom
+        sink-plan:custom-bind
         sink-plan:name
         sink-plan:slot
         sink-plan:so
@@ -54,6 +56,16 @@
           (string-append "(lambda (" args ") (" slot " " args "))")
           fake)))
 
+; A plan whose slot binding is built by bind-proc: (lib) -> code string
+; (lib/vkgen.aura f64vector kernels: guarded wrapper + aux packing + deopt).
+(define (sink-plan:make-custom name so symbol sig arity aura-body bind-proc)
+  (let ((slot (string-append "sink-kernel-" name)) (args (sink-plan-args arity)))
+    (list name slot so symbol sig arity aura-body
+          (string-append "(lambda (" args ") (" slot " " args "))")
+          "" bind-proc)))
+(define (sink-plan-len xs) (if (null? xs) 0 (+ 1 (sink-plan-len (cdr xs)))))
+(define (sink-plan:custom-bind p) (if (> (sink-plan-len p) 9) (sink-plan-nth p 9) #f))
+
 (define (sink-plan:name p) (sink-plan-nth p 0))
 (define (sink-plan:slot p) (sink-plan-nth p 1))
 (define (sink-plan:so p) (sink-plan-nth p 2))
@@ -67,9 +79,11 @@
 ; Body that binds the slot to the C procedure, evaluated inside the workspace.
 ; lib is the c-load handle index.
 (define (sink-plan:bind-body p lib)
-  (if (sink-plan:checked? p)
-      (sink-plan-checked-body p lib)
-      (sink-plan-cfunc p lib (sink-plan:symbol p) (sink-plan:sig p))))
+  (cond
+    ((sink-plan:custom-bind p) ((sink-plan:custom-bind p) lib))
+    ((sink-plan:checked? p)
+     (sink-plan-checked-body p lib))
+    (else (sink-plan-cfunc p lib (sink-plan:symbol p) (sink-plan:sig p)))))
 
 (define (sink-plan-cfunc p lib sym sig)
   (string-append "(c-func " (number->string lib) " \"" sym "\" \"" sig "\")"))
