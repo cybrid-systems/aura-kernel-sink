@@ -94,6 +94,10 @@ checks: 8 passed, 0 failed
 
 **Float kernel**：`kgen:compile-float`（或 `kgen:compile-kind name tree "Float"`）用同一子集生成 `double` 代码：浮点字面量原样保留为 C double，整数字面量变成 `(N.0)`，参数/循环变量/返回值都是 `double`，签名 `(Float ...) -> Float`。类型由 discover 决定：静态上用小整数调用返回整数就是 Int，否则用小浮点调用返回浮点就是 Float；没有浮点字面量的数值函数（如 `hot-fsum`）两者都满足，先当 Int，再靠**活类型反馈**：计数包装同时把首参写进 `sink-argf`，活负载跑完后 `discover:retype!` 把首参是浮点的候选改成 Float。`fixture:float-workspace-code` 是第二个工作区（`hot-fsum`/`cold-add`/`label-of`，与 Int 工作区分开以免超过 8 个过程，#4479）；MVP 第 5 步在里面走完 发现 → 类型反馈 → identify → 生成 double kernel → 闭环，实测约 29–41×，与 Aura 逐位相等。字符串/布尔/除法/调用其他函数在 Float 下同样带原因跳过；Int 路径不变。限制：工作区过程体里的浮点字面量仍读成 0（#4475），所以工作区里的 Float 候选不能写浮点常量（带字面量的 `fpoly` 只在宿主文件里对拍）；Aura 里 `n<=0` 时返回整数 0 而 kernel 返回 0.0，所以 `hot-fsum` 用 `(- h h)` 起步。
 
+### 值编码 ABI（单一来源）
+
+`kernels/sink_abi.h` 不再自己写编码常量，而是直接包含 Aura 的 `lib/aura_value_abi.h`（aura#4502，ABI 4）：`kernels/build.sh` 加 `-I$AURA_LIB`，该头文件变化时重编所有 kernel；fixnum 范围取自 `AURA_FIXNUM_MIN/MAX`，低于 ABI 4 直接 `#error`。每个 kernel 导出 `aura_sink_value_abi()`，`plant:real` 在 `c-load` 后、任何 mutation 之前检查它，不匹配就在 load 阶段拒绝（`kernels/stale_abi.c` 对应测试）。
+
 ### 什么是真的，什么是替身
 
 | 步骤 | 状态 |
@@ -187,6 +191,10 @@ No hand-written candidate list: `discover:scan` reads `(query:code)`, keeps top-
 **Checked remainder / modulo.** Int `(remainder a b)` and `(modulo a b)` compile to `sink_ck_rem` / `sink_ck_mod` (kernels/sink_abi.h). `remainder` truncates and takes the sign of the dividend, like C99 `%`: `(remainder -7 2)` = -1. `modulo` matches what the pinned Aura Soft actually returns: `r = a % b; if (r < 0) r += |b|`, a non-negative result, so `(modulo 7 -2)` = 1 rather than the R7RS floor modulo -1. That is an Aura bug (#4486); the kernel copies it so a sunk define never changes answers, and `-DAURA_SINK_MODULO_FLOOR=1` switches to floor semantics once Aura is fixed. The divisor is tested before any `%` runs: `b == 0` sets status bit 2 (div0) and returns 0, the same exit and wrapper error (`sink: int overflow/div0 ...`) as quotient. `b == -1` returns 0 without executing `%`, so `INT64_MIN % -1` (UB in C) never runs. Within the fixnum range `-2^62 % -1` is 0 and Soft returns 0 too, so there is nothing to fail closed on: the kernel matches Soft instead. An operand outside the fixnum range (only possible from a non-Aura caller) sets bit 1. `|r| < |b|`, so results cannot overflow. `tests/test_kgen_remmod.aura` (17 checks) covers all 18 sign combinations for both ops against Aura, edges at 2^62-1, -2^62 and -2^52, MIN % -1, a gcd tail loop, Soft's catchable div0, kernel div0 → status 2, per-call clearing, and the checked wrapper.
 
 **Float kernels.** `kgen:compile-float` emits the same subset as `double` C: float literals stay C doubles, integer literals become `(N.0)`, signature `(Float ...) -> Float`. discover picks the kind: Int when small integer arguments return an integer, Float when only small float arguments return a float. A numeric body without float literals (`hot-fsum`) is both, so it starts as Int and is promoted by **live type feedback**: the counting wrapper also stores its first argument in `sink-argf`, and `discover:retype!` turns a candidate whose live calls pass a float into Float. `fixture:float-workspace-code` is a second workspace (kept apart from the Int one, aura#4479); MVP step 5 runs discover -> type feedback -> identify -> generated double kernel -> closed loop there (~29-41x, bit-equal to Aura). Workspace Float candidates cannot use float literals yet (aura#4475: they read back as 0), so the literal case (`fpoly`) is checked against a host-file define.
+
+### Value ABI (single source)
+
+`kernels/sink_abi.h` restates no encoding constant: it includes Aura's `lib/aura_value_abi.h` (aura#4502, ABI 4). `kernels/build.sh` adds `-I$AURA_LIB` and rebuilds every kernel when that header changes; the fixnum range comes from `AURA_FIXNUM_MIN/MAX`; anything below ABI 4 is an `#error`. Every kernel exports `aura_sink_value_abi()`, and `plant:real` checks it right after `c-load`, before any mutation, refusing a mismatch at the load stage (tested with `kernels/stale_abi.c`).
 
 ### What runs for real vs stubbed
 

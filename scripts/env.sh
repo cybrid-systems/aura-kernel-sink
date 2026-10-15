@@ -10,6 +10,7 @@ if [ -z "$AURA_BIN" ] || [ ! -x "$AURA_BIN" ]; then
 fi
 AURA_LIB="${AURA_LIB:-$(cd "$(dirname "$AURA_BIN")/../lib" 2>/dev/null && pwd)}"
 export AURA_BIN
+export AURA_LIB
 export AURA_PATH="${AURA_LIB}:${REPO_ROOT}/lib${AURA_PATH:+:$AURA_PATH}"
 # Soft face: sandbox off + tree-walker fallback allowed. Under the default
 # Restricted face std/ffi (c-load / c-func) needs effect:ffi; see README.

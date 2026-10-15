@@ -14,11 +14,17 @@
 ;   (c-func lib sym sig)  probe that the symbol resolves BEFORE mutating,
 ;                      because c-func returns 0 (not an error) on a missing
 ;                      symbol and c-load returns 0 on failure too.
+;   (c-func lib "aura_sink_value_abi" "() -> Int")  must equal plant:value-abi
+;                      (every kernel exports it via AURA_SINK_MODULE): a stale
+;                      .so built against another aura_value_abi.h is refused
+;                      here, before any mutation.
 ; FakePlant: no .so. Binds the slot to an Aura stand-in body from the plan, so
 ;   the control-plane loop (rebind, score, accept/heal) runs end to end on any
 ;   build, including one where aot:reload / c-load are unavailable.
 
-(export plant:real
+(export plant:value-abi
+        plant:abi-ok?
+        plant:real
         plant:fake
         plant:kind
         plant:load
@@ -31,14 +37,25 @@
 (define (plant:load p) (car (cdr p)))
 (define (plant:bind-body p) (car (cdr (cdr p))))
 
+; Aura value encoding this sink is written for (lib/aura_value_abi.h, aura#4502).
+(define (plant:value-abi) 4)
+
+; lib: c-load handle. #t when the .so reports the expected value ABI.
+(define (plant:abi-ok? lib)
+  (let ((q (try (c-func lib "aura_sink_value_abi" "() -> Int") (catch (e) #f))))
+    (and (procedure? q)
+         (equal? (try (q) (catch (e) #f)) (plant:value-abi)))))
+
 (define (plant:real)
   (list "real"
         (lambda (plan)
           (let ((so (sink-plan:so plan)))
             (if (equal? (try (aot:reload so 0) (catch (e) #f)) #t)
                 (let ((lib (c-load so)))
-                  (let ((f (c-func lib (sink-plan:symbol plan) (sink-plan:sig plan))))
-                    (if (procedure? f) (list lib) #f)))
+                  (if (plant:abi-ok? lib)
+                      (let ((f (c-func lib (sink-plan:symbol plan) (sink-plan:sig plan))))
+                        (if (procedure? f) (list lib) #f))
+                      #f))
                 #f)))
         (lambda (plan lib) (sink-plan:bind-body plan lib))))
 

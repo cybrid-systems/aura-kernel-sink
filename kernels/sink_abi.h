@@ -19,17 +19,42 @@
 #define AURA_SINK_ABI_H
 #include <stdint.h>
 
+/* Value encoding: single source of truth is Aura's lib/aura_value_abi.h
+ * (aura#4502). kernels/build.sh passes -I"$AURA_LIB"; nothing below re-states
+ * an encoding constant. Kernels only cross c-func as scalars (C long / double),
+ * so the one thing they need from the encoding is the fixnum range. */
+#if defined(__has_include)
+#if __has_include("aura_value_abi.h")
+#include "aura_value_abi.h"
+#else
+#error "aura_value_abi.h not found: build with -I<aura checkout>/lib (AURA_LIB, see scripts/env.sh)"
+#endif
+#else
+#include "aura_value_abi.h"
+#endif
+#if AURA_VALUE_ABI < 4
+#error "aura-kernel-sink needs Aura value ABI >= 4 (aura#4502, symmetric fixnums + ImmKind float/string)"
+#endif
+/* What this sink was written and tested against. Exported by every kernel
+ * (aura_sink_value_abi) and checked by plant:real before any mutation, so a
+ * stale .so built against another header is rejected at the load stage. */
+#ifndef AURA_SINK_VALUE_ABI /* overridable only to build the stale-ABI test kernel */
+#define AURA_SINK_VALUE_ABI AURA_VALUE_ABI
+#endif
+
 #ifndef AURA_SINK_EMIT_VERSION
 #define AURA_SINK_EMIT_VERSION 0
 #endif
 
 #define AURA_SINK_MODULE \
-  __attribute__((visibility("default"))) const uint64_t aot_emit_version = AURA_SINK_EMIT_VERSION;
+  __attribute__((visibility("default"))) const uint64_t aot_emit_version = AURA_SINK_EMIT_VERSION; \
+  __attribute__((visibility("default"))) long aura_sink_value_abi(void) { return AURA_SINK_VALUE_ABI; }
 
 #define AURA_SINK_EXPORT __attribute__((visibility("default")))
 
-#define AURA_SINK_FIX_MAX ((int64_t)(((uint64_t)1 << 62) - 1))
-#define AURA_SINK_FIX_MIN (-AURA_SINK_FIX_MAX - 1)
+#define AURA_SINK_FIX_MAX ((int64_t)AURA_FIXNUM_MAX)
+#define AURA_SINK_FIX_MIN ((int64_t)AURA_FIXNUM_MIN)
+_Static_assert(AURA_SINK_FIX_MAX == (int64_t)(((uint64_t)1 << 62) - 1), "fixnum max moved: re-check sink_ck_*");
 
 static inline int64_t sink_fix_(int64_t r, int wrapped, int *ovf) {
   if (wrapped || r > AURA_SINK_FIX_MAX || r < AURA_SINK_FIX_MIN) *ovf |= 1;
@@ -98,15 +123,10 @@ static inline int64_t sink_ck_mod(int64_t a, int64_t b, int *ovf) {
   return r;
 }
 
-/* Return guard. Since aura#4482 (value ABI 2) Aura fixnums are the symmetric
- * [-2^62, 2^62-1], so every in-range kernel result crosses c-func as an exact
- * Int. The guard is just the overflow flag; AURA_SINK_RET_MIN stays as an
- * override hook and defaults to the fixnum minimum. */
-#define AURA_SINK_VALUE_ABI 2 /* requires Aura value-encoding ABI >= 2 (aura#4482) */
-#ifndef AURA_SINK_RET_MIN
-#define AURA_SINK_RET_MIN AURA_SINK_FIX_MIN
-#endif
-static inline int sink_ck_ret(int64_t r, int ovf) { return ovf || r < AURA_SINK_RET_MIN; }
+/* Return guard. Since aura#4482 Aura fixnums are the symmetric [-2^62, 2^62-1]
+ * (AURA_FIXNUM_MIN/MAX), so every in-range kernel result crosses c-func as an
+ * exact Int. The guard is just the overflow flag. */
+static inline int sink_ck_ret(int64_t r, int ovf) { (void)r; return ovf; }
 
 /* Per-kernel status (thread-local; read-and-clear accessor): 0 ok, bit 1 = overflow, bit 2 = div0. */
 #define AURA_SINK_OVF_DECL(sym) static _Thread_local long sym##_ovf_;

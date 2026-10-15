@@ -13,15 +13,22 @@ out="$root/build/kernels"
 mkdir -p "$out"
 CC="${CC:-cc}"
 CFLAGS="${CFLAGS:--O2}"
+# Value encoding header (single source, aura#4502): <aura>/lib/aura_value_abi.h
+AURA_LIB="${AURA_LIB:-$(cd "$(dirname "${AURA_BIN:-/nonexistent}")/../lib" 2>/dev/null && pwd || true)}"
+if [ -z "$AURA_LIB" ] || [ ! -f "$AURA_LIB/aura_value_abi.h" ]; then
+  echo "error: AURA_LIB must point at an Aura lib/ with aura_value_abi.h (set AURA_BIN or AURA_LIB)" >&2
+  exit 2
+fi
+abi_h="$AURA_LIB/aura_value_abi.h"
 shopt -s nullglob
 build_one() {  # src extra-flags tag
   local src="$1" extra="$2" tag="$3" name so
   name="$(basename "$src" .c)"
   so="$out/lib$name.so"
-  if [ ! -f "$so" ] || [ "$src" -nt "$so" ] || [ "$here/sink_abi.h" -nt "$so" ]; then
+  if [ ! -f "$so" ] || [ "$src" -nt "$so" ] || [ "$here/sink_abi.h" -nt "$so" ] || [ "$abi_h" -nt "$so" ]; then
     # shellcheck disable=SC2086
     "$CC" $CFLAGS $extra -std=c11 -Wall -Wextra -Werror -shared -fPIC -fvisibility=hidden \
-      -I"$here" -o "$so" "$src"
+      -I"$here" -I"$AURA_LIB" -o "$so" "$src"
     echo "built build/kernels/lib$name.so$tag"
   fi
 }

@@ -249,6 +249,9 @@
     ((string=? variant "slow")
      (sink-plan:make name (fixture:so "bad_slow") "sink_sum_sq" 1
                      (fixture:aura-body name) (fixture-fake name "slow")))
+    ((string=? variant "stale-abi")
+     (sink-plan:make name (fixture:so "stale_abi") "sink_sum_sq" 1
+                     (fixture:aura-body name) ""))
     ((string=? variant "missing")
      (sink-plan:make name (fixture:so "does_not_exist") "sink_sum_sq" 1
                      (fixture:aura-body name) ""))

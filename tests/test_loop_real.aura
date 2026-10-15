@@ -7,6 +7,7 @@
 (require "loop" all:)
 (require "harness" all:)
 (require "std/hot-strategy" all:)
+(require "std/ffi" all:)
 (display "RUN-ONCE") (newline)  ; run_tests.sh fails if this prints twice (silent file re-run)
 
 (define plant (plant:real))
@@ -42,6 +43,15 @@
 (expect "real missing: reason load-failed" (has? "load-failed" (loop:reasons r)))
 (expect "real missing: nothing mutated, nothing rolled back" (not (loop:rolled-back? r)))
 (expect "real missing: kernel slot still 0" (equal? sink-kernel-hot-sum-sq 0))
+
+; Value-ABI gate (aura#4502): a correct kernel built against value ABI 2 is
+; refused at load, before any mutation; a current kernel reports ABI 4.
+(set! r (harness:attempt plant "hot-sum-sq" "stale-abi" (sink-min-speedup)))
+(expect "real stale-abi: rejected at load" (and (not (loop:accepted? r)) (string=? (loop:stage r) "load")))
+(expect "real stale-abi: nothing mutated, slot still 0" (and (not (loop:rolled-back? r)) (equal? sink-kernel-hot-sum-sq 0)))
+(define abi-lib (c-load (fixture:so "sum_sq")))
+(expect "real abi: current kernel exports aura_sink_value_abi = 4" (plant:abi-ok? abi-lib))
+(expect "real abi: stale kernel fails plant:abi-ok?" (not (plant:abi-ok? (c-load (fixture:so "stale_abi")))))
 
 (set! r (harness:attempt plant "cold-add" "good" (sink-min-speedup)))
 (expect "real cold-add: trivial kernel rejected" (not (loop:accepted? r)))

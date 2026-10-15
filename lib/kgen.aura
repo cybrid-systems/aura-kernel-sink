@@ -28,8 +28,7 @@
 ; [-2^62, 2^62-1]: every + - * (and unary -) goes through sink_ck_add / sink_ck_sub /
 ; sink_ck_mul / sink_ck_neg from kernels/sink_abi.h (__builtin_*_overflow + range
 ; check), which set the kernel-local flag `ovf`. Every return and every loop
-; jump tests the flag (a return also refuses results <= -5*10^15, which the
-; pinned Aura cannot take back across c-func; see sink_abi.h); on overflow the kernel stops (goto ovf_exit), records it
+; jump tests the flag); on overflow the kernel stops (goto ovf_exit), records it
 ; in a thread-local status and returns 0. The status is exported as
 ; <symbol>_overflowed (() -> Int, read-and-clear); sink-plan:bind-body wraps
 ; generated Int kernels so a nonzero status raises an Aura error

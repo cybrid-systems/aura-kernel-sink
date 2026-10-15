@@ -1,6 +1,8 @@
 # Improvements and findings
 
-Pinned Aura tip: `d89d39c56` (RelWithDebInfo, Soft face).
+Pinned Aura tip: `542fb9254` (RelWithDebInfo, Soft face; value encoding ABI 4).
+
+- **Value ABI 4 (aura#4502), single source.** `kernels/sink_abi.h` no longer restates any encoding constant: it includes Aura's `lib/aura_value_abi.h` (`kernels/build.sh` adds `-I$AURA_LIB` and rebuilds when that header changes), derives the fixnum range from `AURA_FIXNUM_MIN/MAX`, and `#error`s below ABI 4. Every kernel exports `aura_sink_value_abi()`; `plant:real` calls it right after `c-load` and refuses a mismatch at the load stage, before any mutation (`kernels/stale_abi.c` + `tests/test_loop_real.aura`). Aura has no runtime query for its encoding ABI yet, so the check compares against the ABI this sink was written for (`plant:value-abi`).
 
 ## Aura bugs filed from this repo
 
