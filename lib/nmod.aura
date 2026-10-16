@@ -1,0 +1,107 @@
+; lib/nmod.aura — stateful native modules.
+;
+; csink sinks pure leaves. A data plane needs native STATE: a memtable, open
+; tables, a cache. A c-func can't hold or mutate Aura state, so a stateful
+; native module keeps its state in C, behind opaque Int handles
+; (kernels/nmod.h: handle registry with generations, stale or foreign handles
+; refused), and Aura is the control plane:
+;
+;   nmod:build!  compile a module source once, content-addressed over
+;                (cflags, source, nmod.h): versions / variants are cflags
+;   nmod:load    aot:reload + c-load + kernel ABI check + module identity
+;                (aura_nmod_name / aura_nmod_version) + every function of a
+;                spec bound as a c-func (refused over 6 C args, aura#4553);
+;                #f on any failure, nothing half-loaded is returned
+;   nmod:swap!   hot-swap the implementation behind a cell at a safe point
+;                the caller picked: gate the candidate (caller's randomized
+;                model test against the reference), move the state with the
+;                caller's transfer (export/import, or persist + reopen), keep
+;                the old module for nmod:rollback!
+;
+; spec: list of (name c-symbol kinds ret), kinds/ret as in lib/csink.aura
+; ("S" byte string = String + length, "I" Int; ret "S" or "I"). A String
+; result is copied by c-func (strlen): NULL arrives as 0.
+; Every .so has its own statics, so two loaded versions never share state.
+(export nmod:build! nmod:load nmod:fn nmod:name nmod:version nmod:so nmod:cell nmod:module nmod:state nmod:prev
+        nmod:swap! nmod:rollback!)
+(require "csink" all:)
+(require "plant" all:)
+(require "std/ffi" all:)
+(require "std/process" all:)
+(require "std/fs" all:)
+
+(define (nm-env k d) (let ((v (getenv k))) (if (and (string? v) (> (string-length v) 0)) v d)))
+
+; csrc: path to the module source; tag: file-name tag; cflags: extra C flags
+; (e.g. "-DRKN_IMPL_VERSION=2"); returns the .so path or #f (log next to it)
+(define (nmod:build! csrc tag cflags)
+  (let ((src (read-file csrc)))
+    (if (not (string? src)) #f
+        (let* ((root (nm-env "SINK_ROOT" "."))
+               (here (nm-env "SINK_DIR" root))
+               (hdr (read-file (string-append here "/kernels/nmod.h")))
+               (key (string-append cflags "\n" src "\n" (if (string? hdr) hdr "")))
+               (so (string-append root "/build/kernels/libnmod_" tag "_" (number->string (csink:hash key)) ".so")))
+          (if (file-exists? so) so
+              (begin
+                (shell (string-append "mkdir -p " root "/build/kernels && CFLAGS='-O2 " cflags "' "
+                                      here "/kernels/build_one.sh " csrc " " so " > " so ".log 2>&1"))
+                (if (file-exists? so) so #f)))))))
+
+(define (nm-bind lib spec acc)
+  (if (null? spec) (reverse acc)
+      (let* ((s (car spec)) (kinds (car (cdr (cdr s)))) (ret (car (cdr (cdr (cdr s))))))
+        (if (> (csink:c-arity kinds) csink:max-c-args) #f
+            (let ((f (try (c-func lib (car (cdr s)) (csink:sig kinds ret)) (catch (e) #f))))
+              (if (procedure? f) (nm-bind lib (cdr spec) (cons (cons (car s) f) acc)) #f))))))
+
+; module = #(name version so fns)
+(define (nmod:load so spec)
+  (if (not (string? so)) #f
+      (if (not (equal? (try (aot:reload so 0) (catch (e) #f)) #t)) #f
+          (let ((lib (c-load so)))
+            (if (not (plant:abi-ok? lib)) #f
+                (let ((nm (try (c-func lib "aura_nmod_name" "() -> String") (catch (e) #f)))
+                      (vr (try (c-func lib "aura_nmod_version" "() -> Int") (catch (e) #f))))
+                  (if (not (and (procedure? nm) (procedure? vr))) #f
+                      (let ((fns (nm-bind lib spec (list))))
+                        (if fns (vector (nm) (vr) so fns) #f)))))))))
+(define (nmod:name m) (vector-ref m 0))
+(define (nmod:version m) (vector-ref m 1))
+(define (nmod:so m) (vector-ref m 2))
+(define (nmod:fn m name)
+  (let loop ((fs (vector-ref m 3)))
+    (cond ((null? fs) (error (string-append "nmod: no function " name " in " (vector-ref m 0))))
+          ((equal? (car (car fs)) name) (cdr (car fs)))
+          (else (loop (cdr fs))))))
+
+; cell = #(module state prev-module prev-state)
+(define (nmod:cell m state) (vector m state #f #f))
+(define (nmod:module c) (vector-ref c 0))
+(define (nmod:state c) (vector-ref c 1))
+(define (nmod:prev c) (vector-ref c 2))
+
+; gate: (lambda (cand) #t/#f), run BEFORE any state moves.
+; transfer: (lambda (old-module old-state new-module) new-state or #f); it
+; runs at the caller's safe point and must leave the old state usable when it
+; returns #f.  -> "SWAP" | "REJECT" (gate) | "ABORT" (load failed or transfer refused)
+(define (nmod:swap! cell cand gate transfer)
+  (cond ((not cand) "ABORT")
+        ((not (gate cand)) "REJECT")
+        (else
+         (let ((ns (transfer (vector-ref cell 0) (vector-ref cell 1) cand)))
+           (if (not ns) "ABORT"
+               (begin
+                 (vector-set! cell 2 (vector-ref cell 0)) (vector-set! cell 3 (vector-ref cell 1))
+                 (vector-set! cell 0 cand) (vector-set! cell 1 ns)
+                 "SWAP"))))))
+; back to the previous module (state moved again with transfer)
+(define (nmod:rollback! cell transfer)
+  (let ((pm (vector-ref cell 2)))
+    (if (not pm) "NOOP"
+        (let ((ns (transfer (vector-ref cell 0) (vector-ref cell 1) pm)))
+          (if (not ns) "ABORT"
+              (begin
+                (vector-set! cell 2 #f) (vector-set! cell 3 #f)
+                (vector-set! cell 0 pm) (vector-set! cell 1 ns)
+                "ROLLBACK"))))))

@@ -144,6 +144,10 @@ checks: 8 passed, 0 failed
 
 小叶子换成 vkgen 包装后常常更慢：包装本身是好几个 Soft op，而且每次 `mutate:rebind` + `eval-current` 都让进程更接近 aura#4550（被换掉的 define 的调用者变成 "invalid closure"）。`policy:sink-host!` 走另一条路：一个手写 C 函数代表一整个 Aura define（粗粒度：整条 WAL 记录、整块构建、整块点查、整段缓存模拟），调用方模块自己持有一个槽（模块变量），入口函数每次检查槽：有 kernel 就直接调 c-func 原始过程，拒绝（NULL / 1<<62 哨兵）时回落到 Aura define。流程：画像下限 → cc 一次（内容寻址 .so）→ aot:reload + c-load + ABI 检查 → 装入槽 → 影子门（入口 vs Aura define，不一致 ABORT 并卸下）→ golden + 计时 → KEEP 或卸下（ROLLBACK）。工作区从不被修改（`ast:generation` 不变）。测试：`tests/test_csink.aura`（13 checks）。aura-rocks 的 12 个叶子都走这条路。
 
+### 有状态原生模块（`lib/nmod.aura`、`kernels/nmod.h`）
+
+csink 只能下沉纯函数叶子；数据面需要原生**状态**（memtable、打开的表、cache）。c-func 无法持有或修改 Aura 状态，所以有状态模块把状态留在 C 里，Aura 只拿不透明的 Int 句柄（`nmod.h` 的句柄表带代际号：陈旧句柄、别的版本 .so 的句柄都被拒绝，不会解引用），Aura 只做控制面。`nmod:build!` 按 (cflags, 源码, nmod.h) 内容寻址编译，版本/变体就是 cflags；`nmod:load` 做 aot:reload + c-load + ABI 检查 + 模块身份（`aura_nmod_name`/`aura_nmod_version`）+ 按 spec 绑定所有函数（超过 6 个 C 参数拒绝，aura#4553），任一步失败返回 #f；`nmod:swap!` 在调用方选定的安全点热换实现：先用调用方的随机模型测试门控候选，再用调用方的 transfer（导出/导入，或落盘后重开）迁移状态，旧模块留给 `nmod:rollback!`。每个 .so 有自己的静态区，两个版本并存互不共享状态。`tests/test_nmod.aura` 19 项（`kernels/nmod_counter.c`：错误版本 REJECT、SWAP 迁移状态、ROLLBACK）。消费方：aura-rocks 的原生数据面（`native/rk_native.c`）。
+
 ### 值编码 ABI（单一来源）
 
 `kernels/sink_abi.h` 不再自己写编码常量，而是直接包含 Aura 的 `lib/aura_value_abi.h`（aura#4502，ABI 4）：`kernels/build.sh` 加 `-I$AURA_LIB`，该头文件变化时重编所有 kernel；fixnum 范围取自 `AURA_FIXNUM_MIN/MAX`，低于 ABI 4 直接 `#error`。每个 kernel 导出 `aura_sink_value_abi()`，`plant:real` 在 `c-load` 后、任何 mutation 之前检查它，不匹配就在 load 阶段拒绝（`kernels/stale_abi.c` 对应测试）。
@@ -291,6 +295,16 @@ Timing: `score:set-rounds!` takes the best of several timed rounds; the vector t
 ### Hand-written C kernels in a host slot (`lib/csink.aura`, `policy:sink-host!`)
 
 A small leaf swapped for a vkgen wrapper is often slower: the wrapper is several Soft ops, and each `mutate:rebind` + `eval-current` moves the process toward aura#4550 (callers of a rebound define become "invalid closure"). `policy:sink-host!` is the other path: one hand-written C function stands for a whole Aura define (coarse: a whole WAL record, a whole block build, a whole in-block point lookup, a whole cache simulation); the calling module owns a slot (a module variable) that its entry point checks per call, calling the raw c-func when set and falling back to the Aura define when the kernel refuses (NULL / the 1<<62 sentinel). Steps: profile floor -> cc once (content-addressed .so) -> aot:reload + c-load + ABI check -> install -> shadow gate (entry point vs the Aura define; mismatch: ABORT + uninstall) -> golden + timing -> KEEP or uninstall (ROLLBACK). The workspace is never mutated (`ast:generation` unchanged). Test: `tests/test_csink.aura` (13 checks). All 12 aura-rocks leaves use it.
+
+### Stateful native modules (`lib/nmod.aura`, `kernels/nmod.h`)
+
+csink sinks pure leaves. A data plane needs native **state** (a memtable, open tables, a cache), and a c-func can't hold or mutate Aura state. So a stateful module keeps its state in C and Aura holds opaque Int handles. The `nmod.h` handle registry uses generations: stale handles and handles of another version's .so are refused and never dereferenced. Aura is the control plane.
+
+- `nmod:build!` compiles content-addressed over (cflags, source, nmod.h); versions and variants are cflags.
+- `nmod:load` checks aot:reload, c-load, the kernel ABI and the module identity (`aura_nmod_name`/`aura_nmod_version`), then binds every function of a spec. Over 6 C args is refused (aura#4553). It returns #f on any failure.
+- `nmod:swap!` hot-swaps the implementation at a safe point the caller picks. It first gates the candidate with the caller's randomized model test. It then moves the state with the caller's transfer (export/import, or persist + reopen) and keeps the old module for `nmod:rollback!`.
+
+Every .so has its own statics, so two loaded versions never share state. `tests/test_nmod.aura` has 19 checks over `kernels/nmod_counter.c`: a wrong version is REJECTed, SWAP moves the state, and ROLLBACK goes back. The consumer is aura-rocks' native data plane (`native/rk_native.c`).
 
 ### Value ABI (single source)
 
