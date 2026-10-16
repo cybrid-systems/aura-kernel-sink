@@ -26,11 +26,12 @@
 ; many c-func calls already, and those collide with low closure ids
 ; (aura#4532).
 
-(export policy:sink! policy:skip! policy:features policy:set-extra! policy:threshold policy:get policy:json policy:append!
+(export policy:sink! policy:sink-host! policy:skip! policy:features policy:set-extra! policy:threshold policy:get policy:json policy:append!
         policy:read policy:summary policy:print)
 
 (require "discover" all:)
 (require "vkgen" all:)
+(require "csink" all:)
 (require "bg" all:)
 (require "watch" all:)
 (require "sink_plan" all:)
@@ -212,6 +213,64 @@
 
 ; A decision taken outside (aura-loop proposed "skip" for this kernel): one
 ; SKIP row at stage "policy", nothing measured, nothing compiled.
+;; ---- host-slot sinking (lib/csink.aura): no workspace mutation
+;; A hand-written C kernel (csrc exports `symbol`) stands for the workspace
+;; define `name`. Instead of mutate:rebind, the caller owns a module-level
+;; slot that its entry point checks on every call; `install!` sets it to the
+;; raw c-func procedure (or #f to remove it). The engine's entry point keeps
+;; the guards and the fallback to the Aura define. No mutate:rebind, no
+;; eval-current, no ast:snapshot: none of aura#4550 (invalid closures after a
+;; few rebinds), aura#4547 (module call reaching another define) or the
+;; slow-call states that rebinding leaves behind applies.
+;;   call     (lambda (args) ...) the engine entry point applied to a list
+;;   probe / cases / bench-arg / reps: as loop:sink-gated, through the entry
+;;   shadow   argument lists: entry point (kernel installed) vs the Aura define
+;; Steps: profile floor -> build -> load + ABI -> install -> shadow gate
+;; (mismatch: uninstall, ABORT) -> golden check + bench -> KEEP or uninstall
+;; (ROLLBACK).
+(define (ph-shadow-ok? call soft shadow)
+  (let walk ((as shadow))
+    (if (null? as) #t
+        (let ((want (try (list (apply soft (car as))) (catch (e) "error")))
+              (got (try (list (call (car as))) (catch (e) "error"))))
+          (if (equal? want got) (walk (cdr as)) #f)))))
+(define (policy:sink-host! name csrc symbol kinds ret install! call samples probe cases shadow bench-arg reps min-soft-us threshold path)
+  (let* ((g0 (ast:generation))
+         (thr (policy:threshold threshold))
+         (tree (watch:tree-of name (discover:defines (discover:scan)))))
+    (set! policy-pinned (list install! call samples probe cases shadow tree))
+    (set! policy-cur-floor min-soft-us)
+    (set! policy-cur-action "sink-host")
+    (set! policy-cur-feats (if tree (policy:features tree samples kinds) #f))
+    (install! #f)
+    (if (not tree)
+        (policy:append! path (policy-row name "SKIP" "discover" (list "no-define") kinds "" thr 0.0 0.0 0 0 reps bench-arg g0 #f #t))
+        (let* ((pn (if (< reps 4) 2 (quotient reps 2)))
+               (t-soft (pr-time probe bench-arg pn))
+               (soft-us (/ (* 1000.0 t-soft) pn)))
+          (if (< soft-us min-soft-us)
+              (policy:append! path (policy-row name "SKIP" "profile" (list "too-cheap") kinds "" thr 0.0 soft-us t-soft 0 reps bench-arg g0 #f #t))
+              (let ((so (csink:build! csrc symbol)))
+                (if (not so)
+                    (policy:append! path (policy-row name "SKIP" "compile" (list "cc-failed" csrc) kinds "" thr 0.0 soft-us t-soft 0 reps bench-arg g0 #f #t))
+                    (let ((k (csink:load so symbol kinds ret)))
+                      (if (not k)
+                          (policy:append! path (policy-row name "ABORT" "load" (list "load-failed") kinds so thr 0.0 soft-us t-soft 0 reps bench-arg g0 #f #t))
+                          (let* ((golden (score:golden probe cases))
+                                 (t-before (score:bench probe bench-arg reps))
+                                 (soft (eval name)))
+                            (install! k)
+                            (if (not (ph-shadow-ok? call soft shadow))
+                                (begin (install! #f)
+                                       (policy:append! path (policy-row name "ABORT" "gate" (list "gate-mismatch") kinds so thr 0.0 soft-us t-before 0 reps bench-arg g0 #f #t)))
+                                (let ((s (score:evaluate golden t-before probe bench-arg reps thr)))
+                                  (if (score:accept? s)
+                                      (policy:append! path (policy-row name "KEEP" "score" (list) kinds so thr (score:speedup s) soft-us t-before (score:t-after s) reps bench-arg g0 #f #t))
+                                      (begin
+                                        (install! #f)
+                                        (policy:append! path (policy-row name "ROLLBACK" "score" (score:reasons s) kinds so thr (score:speedup s) soft-us t-before (score:t-after s) reps bench-arg g0
+                                                                         #t (= (score:check probe golden) 0)))))))))))))))))
+
 (define (policy:skip! name samples reason threshold min-soft-us path)
   (let* ((thr (policy:threshold threshold))
          (tree (watch:tree-of name (discover:defines (discover:scan)))))

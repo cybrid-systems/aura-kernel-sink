@@ -1,0 +1,71 @@
+; lib/csink.aura — hand-written C kernels installed into a host slot.
+;
+; vkgen compiles small Int / byte-string leaves and swaps the workspace
+; define for a guarded wrapper (mutate:rebind). For leaves that are small or
+; called from engine modules that path costs more than it saves: the wrapper
+; is several Soft ops per call, and every rebind + eval-current moves the
+; process toward aura#4550 (callers of a rebound define become "invalid
+; closure") and slow-call states. csink is the other path:
+;
+;   1. coarse kernels: one hand-written C function stands for a whole Aura
+;      define ("encode + checksum a WAL record", "build a block", "build a
+;      bloom filter", "point lookup in a block", "simulate a cache policy
+;      over a trace"). The Aura define stays the specification: shadow-gate
+;      oracle and fallback.
+;   2. host slot: the caller's entry point (a module function) holds the raw
+;      c-func in a module variable and checks it per call; policy:sink-host!
+;      (lib/policy.aura) profiles, builds, loads, installs, gates, scores and
+;      keeps or uninstalls it. The workspace is never mutated.
+;
+; A kernel can refuse an input (non-ASCII, embedded NUL, out of range): NULL
+; for a String result, the out-of-fixnum sentinel 1<<62 (arrives as a Float)
+; for an Int result; the entry point then calls the Aura define.
+;
+; Kinds: "S" byte string (passed as char* + Aura length), "I" Int.
+; Ret:   "I" Int, "S" String (kernel returns a NUL-terminated buffer it owns;
+;        c-func copies it).
+; c-func does not type-check its arguments (aura#4551): entry points must
+; only pass Strings to "S" and Ints to "I".
+(export csink:sig csink:load csink:build! csink:hash csink:arity)
+(require "bg" all:)
+(require "plant" all:)
+(require "std/ffi" all:)
+(require "std/process" all:)
+(require "std/fs" all:)
+
+(define (cs-join xs sep) (if (null? xs) "" (let loop ((xs (cdr xs)) (acc (car xs))) (if (null? xs) acc (loop (cdr xs) (string-append acc sep (car xs)))))))
+(define (cs-rev xs) (let loop ((xs xs) (acc (list))) (if (null? xs) acc (loop (cdr xs) (cons (car xs) acc)))))
+(define (cs-len xs) (if (null? xs) 0 (+ 1 (cs-len (cdr xs)))))
+(define (csink:arity kinds) (cs-len kinds))
+
+(define (csink:sig kinds ret)
+  (string-append "("
+                 (cs-join (map (lambda (k) (if (equal? k "S") "String Int" "Int")) kinds) " ")
+                 ") -> " (if (equal? ret "S") "String" "Int")))
+
+(define (cs-params n) (let loop ((k 0) (acc (list))) (if (>= k n) (cs-rev acc) (loop (+ k 1) (cons (string-append "a" (number->string k)) acc)))))
+
+; load a built kernel: aot:reload + c-load + ABI check, the raw c-func or #f
+(define (csink:load so sym kinds ret)
+  (if (equal? (try (aot:reload so 0) (catch (e) #f)) #t)
+      (let ((lib (c-load so)))
+        (if (plant:abi-ok? lib)
+            (let ((f (try (c-func lib sym (csink:sig kinds ret)) (catch (e) #f))))
+              (if (procedure? f) f #f))
+            #f))
+      #f))
+
+(define (csink:hash s) (bg:hash s))
+
+; compile csrc (path) once into a content-addressed .so; returns the path or #f
+(define (csink:build! csrc tag)
+  (let ((src (read-file csrc)))
+    (if (not (string? src)) #f
+        (let* ((root (let ((r (getenv "SINK_ROOT"))) (if (and (string? r) (> (string-length r) 0)) r ".")))
+               (here (let ((d (getenv "SINK_DIR"))) (if (and (string? d) (> (string-length d) 0)) d root)))
+               (so (string-append root "/build/kernels/libcsink_" tag "_" (number->string (csink:hash src)) ".so"))
+               (log (string-append so ".log")))
+          (if (file-exists? so) so
+              (begin
+                (shell (string-append "mkdir -p " root "/build/kernels && " here "/kernels/build_one.sh " csrc " " so " > " log " 2>&1"))
+                (if (file-exists? so) so #f)))))))

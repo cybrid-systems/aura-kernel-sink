@@ -140,6 +140,10 @@ checks: 8 passed, 0 failed
 
 计时：`score:set-rounds!` 取多轮中最好的一轮，向量测试和策略用 3 轮。共享机器上毫秒级计时有抖动，单轮时偶尔会把 accept 翻成 too-slow。
 
+### 手写 C kernel + 宿主槽（`lib/csink.aura`、`policy:sink-host!`）
+
+小叶子换成 vkgen 包装后常常更慢：包装本身是好几个 Soft op，而且每次 `mutate:rebind` + `eval-current` 都让进程更接近 aura#4550（被换掉的 define 的调用者变成 "invalid closure"）。`policy:sink-host!` 走另一条路：一个手写 C 函数代表一整个 Aura define（粗粒度：整条 WAL 记录、整块构建、整块点查、整段缓存模拟），调用方模块自己持有一个槽（模块变量），入口函数每次检查槽：有 kernel 就直接调 c-func 原始过程，拒绝（NULL / 1<<62 哨兵）时回落到 Aura define。流程：画像下限 → cc 一次（内容寻址 .so）→ aot:reload + c-load + ABI 检查 → 装入槽 → 影子门（入口 vs Aura define，不一致 ABORT 并卸下）→ golden + 计时 → KEEP 或卸下（ROLLBACK）。工作区从不被修改（`ast:generation` 不变）。测试：`tests/test_csink.aura`（13 checks）。aura-rocks 的 12 个叶子都走这条路。
+
 ### 值编码 ABI（单一来源）
 
 `kernels/sink_abi.h` 不再自己写编码常量，而是直接包含 Aura 的 `lib/aura_value_abi.h`（aura#4502，ABI 4）：`kernels/build.sh` 加 `-I$AURA_LIB`，该头文件变化时重编所有 kernel；fixnum 范围取自 `AURA_FIXNUM_MIN/MAX`，低于 ABI 4 直接 `#error`。每个 kernel 导出 `aura_sink_value_abi()`，`plant:real` 在 `c-load` 后、任何 mutation 之前检查它，不匹配就在 load 阶段拒绝（`kernels/stale_abi.c` 对应测试）。
@@ -283,6 +287,10 @@ The threshold is passed in. With `#f` it is read from the workspace policy defin
 `scripts/policy_all.sh` runs one Aura process per kernel (`SINK_ONLY`), all appending to the same trajectory. Reason: aura#4532. The more c-funcs one process has made, the less stable later sinks get, and a single process reached 13 GB RSS by the 7th–8th kernel. With one process per kernel, a full round of 9 kernels takes about 20 s. aura-loop (`python3 -m aura_loop --sink`) drives this script; its README has the results.
 
 Timing: `score:set-rounds!` takes the best of several timed rounds; the vector tests and the policy use 3. On a shared box a single ms-timer round occasionally flipped an accept to too-slow.
+
+### Hand-written C kernels in a host slot (`lib/csink.aura`, `policy:sink-host!`)
+
+A small leaf swapped for a vkgen wrapper is often slower: the wrapper is several Soft ops, and each `mutate:rebind` + `eval-current` moves the process toward aura#4550 (callers of a rebound define become "invalid closure"). `policy:sink-host!` is the other path: one hand-written C function stands for a whole Aura define (coarse: a whole WAL record, a whole block build, a whole in-block point lookup, a whole cache simulation); the calling module owns a slot (a module variable) that its entry point checks per call, calling the raw c-func when set and falling back to the Aura define when the kernel refuses (NULL / the 1<<62 sentinel). Steps: profile floor -> cc once (content-addressed .so) -> aot:reload + c-load + ABI check -> install -> shadow gate (entry point vs the Aura define; mismatch: ABORT + uninstall) -> golden + timing -> KEEP or uninstall (ROLLBACK). The workspace is never mutated (`ast:generation` unchanged). Test: `tests/test_csink.aura` (13 checks). All 12 aura-rocks leaves use it.
 
 ### Value ABI (single source)
 
