@@ -121,13 +121,20 @@
                (pf-walk-list (cdr (cdr rest)) (pf-walk-binds (car (cdr rest)) a))
                (if (pair? rest) (pf-walk-list (cdr rest) (pf-walk-binds (car rest) a)) a))))
         (else (pf-walk-list (cdr t) (pf-bump (car t) acc)))))
-(define (pf-count-v ks n) (cond ((not ks) 0) ((null? ks) n) ((equal? (car ks) "V") (pf-count-v (cdr ks) (+ n 1))) (else (pf-count-v (cdr ks) n))))
-(define (pf-vlen xs) (cond ((null? xs) 0) ((string? (car xs)) (f64vector-length (car xs))) (else (pf-vlen (cdr xs)))))
+(define (pf-count-v ks n) (cond ((not ks) 0) ((null? ks) n) ((or (equal? (car ks) "V") (equal? (car ks) "S")) (pf-count-v (cdr ks) (+ n 1))) (else (pf-count-v (cdr ks) n))))
+; Length of the first vector ("V": f64vector elements) or byte-string ("S":
+; string-length) sample, by the kinds when known.
+(define (pf-vlen xs ks)
+  (cond ((null? xs) 0)
+        ((and (pair? ks) (equal? (car ks) "S") (string? (car xs))) (string-length (car xs)))
+        ((and (pair? ks) (equal? (car ks) "V") (string? (car xs))) (f64vector-length (car xs)))
+        ((and (not (pair? ks)) (string? (car xs))) (f64vector-length (car xs)))
+        (else (pf-vlen (cdr xs) (if (pair? ks) (cdr ks) ks)))))
 (define (policy:features tree samples kinds)
   (let ((params (if (and (pair? tree) (pair? (cdr tree))) (car (cdr tree)) (list))))
     (list (if (pair? params) (length params) 0)
           (pf-count-v kinds 0)
-          (pf-vlen samples)
+          (pf-vlen samples kinds)
           (let loop ((ops (if (and (pair? tree) (pair? (cdr tree)) (pair? (cdr (cdr tree)))) (pf-walk (car (cdr (cdr tree))) (list)) (list))) (acc (list)))
             (if (null? ops) acc
                 (loop (cdr ops) (cons (string-append (car (car ops)) ":" (number->string (cdr (car ops)))) acc)))))))

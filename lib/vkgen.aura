@@ -4,6 +4,12 @@
 ; per parameter:
 ;   "V"  f64vector (only used as the first argument of f64vector-ref /
 ;        f64vector-length; may be passed unchanged in a self tail call)
+;   "S"  byte string (only used as the first argument of string-ref /
+;        string-length; same calling convention as "V"). (string-ref s i)
+;        is the Int code of byte i, bounds-checked (status bit 4). Strings
+;        are passed as their bytes, so an S kernel matches Soft only for
+;        7-bit strings (Aura string-ref/string-length count code points;
+;        the shadow gate compares on the caller's samples).
 ;   "I"  exact Int (int64, every + - * / quotient remainder modulo checked)
 ;   "F"  Float (double)
 ; Output: (#t c-source ret-kind) | (#f reason). ret-kind "I" | "F".
@@ -35,7 +41,7 @@
 ; where it takes a vector) never reach C: the wrapper falls back to the Aura
 ; body (deopt), so a sunk define answers exactly like the original.
 
-(export vkgen:compile vkgen:symbol vkgen:base vkgen:vector-params vkgen:kinds
+(export vkgen:compile vkgen:symbol vkgen:base vkgen:vector-params vkgen:string-params vkgen:kinds
         vkgen:sig vkgen:bind-body vkgen:f64ret-native? vkgen:emit! vkgen:print)
 
 (require "std/ffi" all:)
@@ -100,9 +106,9 @@
                  (loop (cdr xs) (vk-ok (string-append (vk-checked op) "(" (vk-code acc) ", " (vk-code r) ", &ovf)") "I")))
                 (else (loop (cdr xs) (vk-ok (string-append "(" (vk-dbl acc) " " op " " (vk-dbl r) ")") "F"))))))))
 
-(define (vk-vec-arg a env)
+(define (vk-vec-arg a env kind)
   (let ((e (and (string? a) (vk-lookup a env))))
-    (if (and e (equal? (car (cdr (cdr e))) "V")) e #f)))
+    (if (and e (equal? (car (cdr (cdr e))) kind)) e #f)))
 
 (define (vk-unary h args env loops)
   (let ((r (vk-expr (car args) env loops)))
@@ -130,8 +136,8 @@
            ((vk-float-literal? t) (vk-ok (string-append "(" t ")") "F"))
            ((vk-lookup t env)
             (let ((e (vk-lookup t env)))
-              (if (equal? (car (cdr (cdr e))) "V")
-                  (vk-err (string-append "vector " t " used as a number"))
+              (if (vk-in? (car (cdr (cdr e))) (list "V" "S"))
+                  (vk-err (string-append "vector/string " t " used as a number"))
                   (vk-ok (car (cdr e)) (car (cdr (cdr e)))))))
            (else (vk-err (string-append "free variable " t)))))
     ((null? t) (vk-err "empty form"))
@@ -159,14 +165,23 @@
                                                     (else "sink_ck_mod"))
                                               "(" (vk-code a) ", " (vk-code b) ", &ovf)") "I")))))
          ((and (string=? h "f64vector-ref") (= n 2))
-          (let ((v (vk-vec-arg (car args) env)) (i (vk-expr (car (cdr args)) env loops)))
+          (let ((v (vk-vec-arg (car args) env "V")) (i (vk-expr (car (cdr args)) env loops)))
             (cond ((not v) (vk-err "f64vector-ref on something that is not a vector parameter"))
                   ((not (vk-ok? i)) i)
                   ((not (equal? (vk-type i) "I")) (vk-err "f64vector-ref with a Float index"))
                   (else (vk-ok (string-append "sink_vref(" (car (cdr v)) ", " (car (cdr (cdr (cdr v)))) ", " (vk-code i) ", &ovf)") "F")))))
          ((and (string=? h "f64vector-length") (= n 1))
-          (let ((v (vk-vec-arg (car args) env)))
+          (let ((v (vk-vec-arg (car args) env "V")))
             (if v (vk-ok (car (cdr (cdr (cdr v)))) "I") (vk-err "f64vector-length on something that is not a vector parameter"))))
+         ((and (string=? h "string-ref") (= n 2))
+          (let ((v (vk-vec-arg (car args) env "S")) (i (vk-expr (car (cdr args)) env loops)))
+            (cond ((not v) (vk-err "string-ref on something that is not a string parameter"))
+                  ((not (vk-ok? i)) i)
+                  ((not (equal? (vk-type i) "I")) (vk-err "string-ref with a Float index"))
+                  (else (vk-ok (string-append "sink_sref(" (car (cdr v)) ", " (car (cdr (cdr (cdr v)))) ", " (vk-code i) ", &ovf)") "I")))))
+         ((and (string=? h "string-length") (= n 1))
+          (let ((v (vk-vec-arg (car args) env "S")))
+            (if v (vk-ok (car (cdr (cdr (cdr v)))) "I") (vk-err "string-length on something that is not a string parameter"))))
          ((and (vk-in? h (list "sqrt" "abs" "exact->inexact" "inexact")) (= n 1)) (vk-unary h args env loops))
          ((and (vk-in? h (list "min" "max")) (= n 2)) (vk-minmax h args env loops))
          ((and (string=? h "if") (= n 3))
@@ -220,7 +235,7 @@
           (cond
             ((null? xs)
              (vk-ok (string-append ind "{\n" decl ind "  if (ovf) goto ovf_exit;\n" asg ind "  goto top_" d ";\n" ind "}\n") "S"))
-            ((equal? (car ts) "V")
+            ((vk-in? (car ts) (list "V" "S"))
              (if (equal? (car xs) (car vs))
                  (walk (cdr xs) (cdr vs) (cdr ts) (+ k 1) decl asg)
                  (vk-err (string-append "vector argument of " (car loop) " changes in a tail call"))))
@@ -300,16 +315,27 @@
         ((and (string? (car t)) (vk-in? (car t) (list "f64vector-ref" "f64vector-length"))
               (pair? (cdr t)) (equal? (car (cdr t)) p)) #t)
         (else (let any ((xs t)) (cond ((null? xs) #f) ((vk-uses-vec? p (car xs)) #t) (else (any (cdr xs))))))))
+(define (vk-uses-str? p t)
+  (cond ((not (pair? t)) #f)
+        ((and (string? (car t)) (vk-in? (car t) (list "string-ref" "string-length"))
+              (pair? (cdr t)) (equal? (car (cdr t)) p)) #t)
+        (else (let any ((xs t)) (cond ((null? xs) #f) ((vk-uses-str? p (car xs)) #t) (else (any (cdr xs))))))))
+(define (vkgen:string-params tree)
+  (let ((params (car (cdr tree))) (body (car (cdr (cdr tree)))))
+    (let loop ((ps params) (acc (list)))
+      (if (null? ps) (vk-rev acc) (loop (cdr ps) (if (vk-uses-str? (car ps) body) (cons (car ps) acc) acc))))))
 (define (vkgen:vector-params tree)
   (let ((params (car (cdr tree))) (body (car (cdr (cdr tree)))))
     (let loop ((ps params) (acc (list)))
       (if (null? ps) (vk-rev acc) (loop (cdr ps) (if (vk-uses-vec? (car ps) body) (cons (car ps) acc) acc))))))
 (define (vkgen:kinds tree samples)
-  (let ((vs (vkgen:vector-params tree)))
+  (let ((vs (vkgen:vector-params tree)) (ss (vkgen:string-params tree)))
     (let loop ((ps (car (cdr tree))) (xs samples) (acc (list)))
       (cond ((null? ps) (vk-rev acc))
             ((null? xs) #f)
+            ((and (vk-in? (car ps) vs) (vk-in? (car ps) ss)) #f)
             ((vk-in? (car ps) vs) (if (string? (car xs)) (loop (cdr ps) (cdr xs) (cons "V" acc)) #f))
+            ((vk-in? (car ps) ss) (if (string? (car xs)) (loop (cdr ps) (cdr xs) (cons "S" acc)) #f))
             ((and (integer? (car xs)) (exact? (car xs))) (loop (cdr ps) (cdr xs) (cons "I" acc)))
             ((float? (car xs)) (loop (cdr ps) (cdr xs) (cons "F" acc)))
             (else #f)))))
@@ -322,7 +348,7 @@
     (if (null? ks)
         (string-append "(" acc (if (> (vk-count "F" kinds) 0) (string-append (if (string=? acc "") "" " ") "String") "") ") -> " (if (equal? ret "F") "Float" "Int"))
         (loop (cdr ks)
-              (cond ((equal? (car ks) "V") (string-append acc (if (string=? acc "") "" " ") "String Int"))
+              (cond ((vk-in? (car ks) (list "V" "S")) (string-append acc (if (string=? acc "") "" " ") "String Int"))
                     ((equal? (car ks) "I") (string-append acc (if (string=? acc "") "" " ") "Int"))
                     (else acc))))))
 
@@ -333,8 +359,8 @@
     ((not (= (vk-len tree) 3)) (vk-err "body is not a single form"))
     ((not (and (pair? (car (cdr tree))) (vk-all-strings? (car (cdr tree))))) (vk-err "variadic or zero-arity lambda"))
     ((not (and (pair? kinds) (= (vk-len kinds) (vk-len (car (cdr tree)))))) (vk-err "no kind for every parameter"))
-    ((= (vk-count "V" kinds) 0) (vk-err "no f64vector parameter (use lib/kgen.aura)"))
-    ((> (+ (* 2 (vk-count "V" kinds)) (vk-count "I" kinds) (if (> (vk-count "F" kinds) 0) 1 0)) 6) (vk-err "more than 6 C arguments (c-func limit)"))
+    ((= (+ (vk-count "V" kinds) (vk-count "S" kinds)) 0) (vk-err "no f64vector or string parameter (use lib/kgen.aura)"))
+    ((> (+ (* 2 (+ (vk-count "V" kinds) (vk-count "S" kinds))) (vk-count "I" kinds) (if (> (vk-count "F" kinds) 0) 1 0)) 6) (vk-err "more than 6 C arguments (c-func limit)"))
     (else
      (let* ((params (car (cdr tree))) (nf (vk-count "F" kinds)) (sym (vkgen:symbol name)))
        ; env + C params + entry decls, in parameter order
@@ -348,7 +374,7 @@
                           (args (vk-call-args kinds (> nf 0))))
                      (list #t
                            (string-append
-                            "/* GENERATED by lib/vkgen.aura (f64vector kernel, kinds " (vk-join kinds) " -> " ret ") from the define `" name "`. Do not edit. */\n"
+                            "/* GENERATED by lib/vkgen.aura (vector/string kernel, kinds " (vk-join kinds) " -> " ret ") from the define `" name "`. Do not edit. */\n"
                             "#include <stdint.h>\n#include \"sink_abi.h\"\nAURA_SINK_MODULE\n\n"
                             "AURA_SINK_OVF_DECL(" sym ")\n"
                             "AURA_SINK_EXPORT " rty " " sym "(" cps2 ") {\n"
@@ -362,12 +388,12 @@
                            ret))))
              (let ((p (car ps)) (kd (car ks)) (ks_ (number->string k)))
                (cond
-                 ((equal? kd "V")
+                 ((vk-in? kd (list "V" "S"))
                   (walk (cdr ps) (cdr ks) (+ k 1) (+ vi 1) fi
-                        (cons (list p (string-append "v" ks_) "V" (string-append "n" ks_)) env)
+                        (cons (list p (string-append "v" ks_) kd (string-append "n" ks_)) env)
                         (string-append cps (if (string=? cps "") "" ", ") "const char *v" ks_ ", long n" ks_)
                         decl
-                        (cons p cvars) (cons "V" ctys)))
+                        (cons p cvars) (cons kd ctys)))
                  ((equal? kd "I")
                   (walk (cdr ps) (cdr ks) (+ k 1) vi fi
                         (cons (list p (string-append "l0_" ks_) "I") env)
@@ -387,7 +413,7 @@
     (if (null? ks)
         (if aux? (string-append acc (if (string=? acc "") "" ", ") "aux") acc)
         (loop (cdr ks) (+ k 1)
-              (cond ((equal? (car ks) "V") (string-append acc (if (string=? acc "") "" ", ") "v" (number->string k) ", n" (number->string k)))
+              (cond ((vk-in? (car ks) (list "V" "S")) (string-append acc (if (string=? acc "") "" ", ") "v" (number->string k) ", n" (number->string k)))
                     ((equal? (car ks) "I") (string-append acc (if (string=? acc "") "" ", ") "a" (number->string k)))
                     (else acc))))))
 
@@ -414,7 +440,7 @@
                    (if (null? ks) acc
                        (loop (cdr ks) (+ k 1)
                              (string-append acc " "
-                                            (cond ((equal? (car ks) "V") (string-append "(string? a" (number->string k) ")"))
+                                            (cond ((vk-in? (car ks) (list "V" "S")) (string-append "(string? a" (number->string k) ")"))
                                                   ((equal? (car ks) "I") (string-append "(integer? a" (number->string k) ") (exact? a" (number->string k) ")"))
                                                   (else (string-append "(float? a" (number->string k) ")"))))))))
          (fills (let loop ((ks kinds) (k 0) (fi 0) (acc ""))
@@ -428,6 +454,7 @@
                       (loop (cdr ks) (+ k 1)
                             (cond ((equal? (car ks) "F") acc)
                                   ((equal? (car ks) "V") (string-append acc " a" (number->string k) " (f64vector-length a" (number->string k) ")"))
+                                  ((equal? (car ks) "S") (string-append acc " a" (number->string k) " (string-length a" (number->string k) ")"))
                                   (else (string-append acc " a" (number->string k))))))))
          (ksym (string-append "\"" sym (if (and (equal? ret "F") (not (vkgen:f64ret-native? lib))) "_bits" "") "\"")))
     (string-append
@@ -438,7 +465,7 @@
      "(if (and" guards ") "
      "(let ((x " (if (> nf 0) (string-append "(make-f64vector " (number->string nf) ")") "#f") "))" fills " "
      "(let* ((r (k" cargs ")) (s (o))) "
-     "(if (= s 0) r (error (string-append \"sink: f64vector kernel " name " failed closed, status \" (number->string s) \" (1 int overflow, 2 div0, 4 index out of range)\"))))) "
+     "(if (= s 0) r (error (string-append \"sink: vector kernel " name " failed closed, status \" (number->string s) \" (1 int overflow, 2 div0, 4 index out of range)\"))))) "
      "(fb " ps "))))")))
 
 ; Emit one C file per (name kinds) entry; trees from defs (discover:defines).

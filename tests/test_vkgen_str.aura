@@ -1,0 +1,76 @@
+; tests/test_vkgen_str.aura — byte-string ("S") kernels in lib/vkgen.aura:
+; kinds from string-ref / string-length use, generated C (sink_sref, bounds
+; fail-closed), and the gated policy loop on a string define (KEEP, results
+; equal to Soft, out-of-range raises like Soft, deopt on a non-string arg).
+; Added for cybrid-systems/aura-rocks (checksums / hashes / block search
+; over 7-bit strings).
+(require "expect" all:)
+(require "discover" all:)
+(require "vkgen" all:)
+(require "plant" all:)
+(require "score" all:)
+(require "policy" all:)
+(require "std/ffi" all:)
+(require "std/process" all:)
+(score:set-rounds! 3)
+(display "RUN-ONCE") (newline)
+
+(define plant (plant:real))
+(define (has-sub? s sub)
+  (let ((n (string-length s)) (m (string-length sub)))
+    (let loop ((i 0)) (cond ((> (+ i m) n) #f) ((string=? (substring s i (+ i m)) sub) #t) (else (loop (+ i 1)))))))
+
+(set-code (string-append
+  "(define sink-kernel-sadler 0)\n"
+  "(define sadler (lambda (s start end) (letrec ((loop (lambda (i a b) (if (< i end) (loop (+ i 1) (modulo (+ a (string-ref s i)) 65521) (modulo (+ b (modulo (+ a (string-ref s i)) 65521)) 65521)) (+ (* b 65536) a))))) (loop start 1 0))))\n"
+  "(define sink-kernel-scount 0)\n"
+  "(define scount (lambda (s c) (letrec ((loop (lambda (i n) (if (< i (string-length s)) (loop (+ i 1) (if (= (string-ref s i) c) (+ n 1) n)) n)))) (loop 0 0))))\n"
+  "(define smixed (lambda (s v) (+ (string-ref s 0) (f64vector-ref v 0))))\n"
+  "(define (sink-min-speedup) 2)\n"))
+(eval-current)
+(define defs (discover:defines (discover:scan)))
+(define (tree name) (let f ((ds defs)) (if (string=? (car (car ds)) name) (car (cdr (car ds))) (f (cdr ds)))))
+
+(define big (list->string (let loop ((i 0) (acc (list))) (if (< i 20000) (loop (+ i 1) (cons (integer->char (+ 32 (modulo (* i 7) 95))) acc)) acc))))
+(define small "Wikipedia")
+
+; ---- static
+(expect "kinds: sadler (s start end) -> S I I" (equal? (vkgen:kinds (tree "sadler") (list small 0 9)) (list "S" "I" "I")))
+(expect "string params: scount -> (s)" (equal? (vkgen:string-params (tree "scount")) (list "s")))
+(expect "kinds: non-string sample for an S param -> #f" (equal? (vkgen:kinds (tree "sadler") (list 3 0 9)) #f))
+(expect "sig: S is String + Int length" (equal? (vkgen:sig (list "S" "I" "I") "I") "(String Int Int Int) -> Int"))
+(define g (vkgen:compile "sadler" (tree "sadler") (list "S" "I" "I")))
+(expect "sadler: generated Int kernel with bounds-checked byte loads"
+        (and (car g) (equal? (car (cdr (cdr g))) "I") (has-sub? (car (cdr g)) "sink_sref(v0, n0, ")
+             (has-sub? (car (cdr g)) "long sink_vgen_sadler(const char *v0, long n0, long a1, long a2)")))
+(expect "string-ref on an f64vector param: skipped"
+        (not (car (vkgen:compile "x" (car (cdr (car (discover:defines (discover:read "(define x (lambda (v) (+ (f64vector-ref v 0) (string-ref v 0))))"))))) (list "V")))))
+(expect "same param used as string and vector: no kinds" (equal? (vkgen:kinds (car (cdr (car (discover:defines (discover:read "(define x (lambda (v) (+ (f64vector-ref v 0) (string-ref v 0))))"))))) (list "ab")) #f))
+(expect "string used as a number: skipped"
+        (not (car (vkgen:compile "y" (car (cdr (car (discover:defines (discover:read "(define y (lambda (s) (+ s 1)))"))))) (list "S")))))
+
+; ---- policy loop: sadler on 20000 bytes (KEEP), scount
+(define traj "build/trajectory-str-test.jsonl")
+(shell (string-append "rm -f " traj))
+(define soft-sadler (eval "(lambda (s start end) (letrec ((loop (lambda (i a b) (if (< i end) (loop (+ i 1) (modulo (+ a (string-ref s i)) 65521) (modulo (+ b (modulo (+ a (string-ref s i)) 65521)) 65521)) (+ (* b 65536) a))))) (loop start 1 0)))"))
+(define cases (list 0 1 9 100 20000))
+(define samples-a (list big 0 20000))
+(define shadow-a (list (list big 0 20000) (list small 0 9) (list small 3 3) (list big 17 1234)))
+(define row-a (policy:sink! plant "sadler" samples-a (lambda (k) (sadler big 0 k)) cases shadow-a 20000 5 50 #f traj))
+(policy:print row-a)
+(expect "sadler: KEEP" (equal? (policy:get row-a "decision") "KEEP"))
+(expect "sadler: kinds S I I in the row" (equal? (policy:get row-a "kinds") (list "S" "I" "I")))
+(expect "sadler: features vec_len = string length" (equal? (car (cdr (cdr (policy:get row-a "features")))) 20000))
+(expect "sunk sadler: equal to Soft on all cases"
+        (let loop ((cs cases)) (cond ((null? cs) #t) ((equal? (sadler big 0 (car cs)) (soft-sadler big 0 (car cs))) (loop (cdr cs))) (else #f))))
+(expect "sunk sadler: Adler-32 of Wikipedia" (= (sadler small 0 9) 300286872))
+(expect "bounds: end past the string raises an Aura error, like Soft"
+        (and (equal? (try (sadler small 0 12) (catch (e) "err")) "err") (equal? (try (soft-sadler small 0 12) (catch (e) "err")) "err")))
+(expect "bounds: kernel usable after the error" (= (sadler small 0 9) 300286872))
+(expect "deopt: Float end falls back to the Soft body (same outcome)"
+        (equal? (try (sadler small 0 9.0) (catch (e) "err")) (try (soft-sadler small 0 9.0) (catch (e) "err"))))
+(define row-c (policy:sink! plant "scount" (list big 65) (lambda (k) (scount big 65)) (list 0) (list (list big 65) (list small 105) (list "" 1)) 0 5 50 #f traj))
+(policy:print row-c)
+(expect "scount: KEEP or ROLLBACK (a decision, row written)" (or (equal? (policy:get row-c "decision") "KEEP") (equal? (policy:get row-c "decision") "ROLLBACK")))
+(expect "scount: still correct" (and (= (scount small 105) 3) (= (scount "" 1) 0)))
+(expect "checks all passed" (expect-summary))

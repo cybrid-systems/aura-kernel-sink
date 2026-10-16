@@ -149,6 +149,12 @@ static inline double sink_vref(const char *p, int64_t n, int64_t i, int *ovf) {
   if (i < 0 || i >= n) { *ovf |= 4; return 0.0; }
   double d; memcpy(&d, p + 8 * i, 8); return d;
 }
+/* (string-ref s i) of an "S" (byte string) parameter: the byte's Int code,
+ * unsigned; out of range sets status bit 4 like sink_vref. */
+static inline int64_t sink_sref(const char *p, int64_t n, int64_t i, int *ovf) {
+  if (i < 0 || i >= n) { *ovf |= 4; return 0; }
+  return (int64_t)(unsigned char)p[i];
+}
 /* (sqrt x) of a negative Float is nan in Aura Soft, the same as C. */
 static inline double sink_vsqrt(double x) { return __builtin_sqrt(x); }
 static inline int64_t sink_ck_abs(int64_t a, int *ovf) { return a < 0 ? sink_ck_neg(a, ovf) : a; }
