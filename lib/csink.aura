@@ -26,7 +26,10 @@
 ;        c-func copies it).
 ; c-func does not type-check its arguments (aura#4551): entry points must
 ; only pass Strings to "S" and Ints to "I".
-(export csink:sig csink:load csink:build! csink:hash csink:arity)
+; c-func passes at most 6 C arguments and silently drops the rest
+; (aura#4553): csink:load refuses a kernel whose C arity (an "S" counts 2)
+; is over 6. Pack extra parameters into one String.
+(export csink:sig csink:load csink:build! csink:hash csink:arity csink:c-arity csink:max-c-args)
 (require "bg" all:)
 (require "plant" all:)
 (require "std/ffi" all:)
@@ -37,6 +40,8 @@
 (define (cs-rev xs) (let loop ((xs xs) (acc (list))) (if (null? xs) acc (loop (cdr xs) (cons (car xs) acc)))))
 (define (cs-len xs) (if (null? xs) 0 (+ 1 (cs-len (cdr xs)))))
 (define (csink:arity kinds) (cs-len kinds))
+(define csink:max-c-args 6)
+(define (csink:c-arity kinds) (if (null? kinds) 0 (+ (if (equal? (car kinds) "S") 2 1) (csink:c-arity (cdr kinds)))))
 
 (define (csink:sig kinds ret)
   (string-append "("
@@ -47,7 +52,7 @@
 
 ; load a built kernel: aot:reload + c-load + ABI check, the raw c-func or #f
 (define (csink:load so sym kinds ret)
-  (if (equal? (try (aot:reload so 0) (catch (e) #f)) #t)
+  (if (and (<= (csink:c-arity kinds) csink:max-c-args) (equal? (try (aot:reload so 0) (catch (e) #f)) #t))
       (let ((lib (c-load so)))
         (if (plant:abi-ok? lib)
             (let ((f (try (c-func lib sym (csink:sig kinds ret)) (catch (e) #f))))

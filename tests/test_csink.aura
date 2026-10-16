@@ -41,4 +41,7 @@
 (expect "unknown define: SKIP" (equal? (policy:get r4 "decision") "SKIP"))
 (expect "workspace never mutated" (= (ast:generation) g0))
 (expect "rows written with action sink-host" (equal? (policy:get r1 "action") "sink-host"))
+; c-func passes at most 6 C arguments (aura#4553): a wider kernel is not loaded
+(expect "C arity: S counts 2" (= (csink:c-arity (list "S" "S" "I" "I")) 6))
+(expect "kernel over 6 C args refused by csink:load" (not (csink:load (csink:build! csrc "host_adler") "host_adler" (list "S" "S" "S" "I" "I") "I")))
 (expect "checks all passed" (expect-summary))
