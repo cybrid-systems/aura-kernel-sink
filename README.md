@@ -146,7 +146,7 @@ checks: 8 passed, 0 failed
 
 ### 有状态原生模块（`lib/nmod.aura`、`kernels/nmod.h`）
 
-csink 只能下沉纯函数叶子；数据面需要原生**状态**（memtable、打开的表、cache）。c-func 无法持有或修改 Aura 状态，所以有状态模块把状态留在 C 里，Aura 只拿不透明的 Int 句柄（`nmod.h` 的句柄表带代际号：陈旧句柄、别的版本 .so 的句柄都被拒绝，不会解引用），Aura 只做控制面。`nmod:build!` 按 (cflags, 源码, nmod.h) 内容寻址编译，版本/变体就是 cflags；`nmod:load` 做 aot:reload + c-load + ABI 检查 + 模块身份（`aura_nmod_name`/`aura_nmod_version`）+ 按 spec 绑定所有函数（超过 6 个 C 参数拒绝，aura#4553），任一步失败返回 #f；`nmod:swap!` 在调用方选定的安全点热换实现：先用调用方的随机模型测试门控候选，再用调用方的 transfer（导出/导入，或落盘后重开）迁移状态，旧模块留给 `nmod:rollback!`。每个 .so 有自己的静态区，两个版本并存互不共享状态。`tests/test_nmod.aura` 19 项（`kernels/nmod_counter.c`：错误版本 REJECT、SWAP 迁移状态、ROLLBACK）。消费方：aura-rocks 的原生数据面（`native/rk_native.c`）。
+csink 只能下沉纯函数叶子；数据面需要原生**状态**（memtable、打开的表、cache）。c-func 无法持有或修改 Aura 状态，所以有状态模块把状态留在 C 里，Aura 只拿不透明的 Int 句柄（`nmod.h` 的句柄表带代际号：陈旧句柄、别的版本 .so 的句柄都被拒绝，不会解引用），Aura 只做控制面。`nmod:build!` 按 (cflags, 源码, nmod.h) 内容寻址编译，版本/变体就是 cflags；`nmod:load` 做 aot:reload + c-load + ABI 检查 + 模块身份（`aura_nmod_name`/`aura_nmod_version`）+ 按 spec 绑定所有函数（超过 6 个 C 参数拒绝，aura#4553；超过 1 个 String 参数也拒绝：短 String 后面再跟一个 String 时，传到 C 的是悬空指针，aura#4554），任一步失败返回 #f；`nmod:build!` 还可以传入源码 include 的依赖文件，一起参与内容寻址；`nmod:swap!` 在调用方选定的安全点热换实现：先用调用方的随机模型测试门控候选，再用调用方的 transfer（导出/导入，或落盘后重开）迁移状态，旧模块留给 `nmod:rollback!`。每个 .so 有自己的静态区，两个版本并存互不共享状态。`tests/test_nmod.aura` 20 项（`kernels/nmod_counter.c`：错误版本 REJECT、SWAP 迁移状态、ROLLBACK）。消费方：aura-rocks 的原生数据面（`native/rk_native.c`）。
 
 ### 值编码 ABI（单一来源）
 
@@ -301,10 +301,10 @@ A small leaf swapped for a vkgen wrapper is often slower: the wrapper is several
 csink sinks pure leaves. A data plane needs native **state** (a memtable, open tables, a cache), and a c-func can't hold or mutate Aura state. So a stateful module keeps its state in C and Aura holds opaque Int handles. The `nmod.h` handle registry uses generations: stale handles and handles of another version's .so are refused and never dereferenced. Aura is the control plane.
 
 - `nmod:build!` compiles content-addressed over (cflags, source, nmod.h); versions and variants are cflags.
-- `nmod:load` checks aot:reload, c-load, the kernel ABI and the module identity (`aura_nmod_name`/`aura_nmod_version`), then binds every function of a spec. Over 6 C args is refused (aura#4553). It returns #f on any failure.
+- `nmod:load` checks aot:reload, c-load, the kernel ABI and the module identity (`aura_nmod_name`/`aura_nmod_version`), then binds every function of a spec. Over 6 C args is refused (aura#4553), and so is more than one String arg: a short String followed by another String reaches C as a dangling pointer (aura#4554). It returns #f on any failure. `nmod:build!` also takes the files the source includes, so they are part of the content address.
 - `nmod:swap!` hot-swaps the implementation at a safe point the caller picks. It first gates the candidate with the caller's randomized model test. It then moves the state with the caller's transfer (export/import, or persist + reopen) and keeps the old module for `nmod:rollback!`.
 
-Every .so has its own statics, so two loaded versions never share state. `tests/test_nmod.aura` has 19 checks over `kernels/nmod_counter.c`: a wrong version is REJECTed, SWAP moves the state, and ROLLBACK goes back. The consumer is aura-rocks' native data plane (`native/rk_native.c`).
+Every .so has its own statics, so two loaded versions never share state. `tests/test_nmod.aura` has 20 checks over `kernels/nmod_counter.c`: a wrong version is REJECTed, SWAP moves the state, and ROLLBACK goes back. The consumer is aura-rocks' native data plane (`native/rk_native.c`).
 
 ### Value ABI (single source)
 

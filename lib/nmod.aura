@@ -10,7 +10,9 @@
 ;                (cflags, source, nmod.h): versions / variants are cflags
 ;   nmod:load    aot:reload + c-load + kernel ABI check + module identity
 ;                (aura_nmod_name / aura_nmod_version) + every function of a
-;                spec bound as a c-func (refused over 6 C args, aura#4553);
+;                spec bound as a c-func (refused over 6 C args, aura#4553, or
+;                over one String arg: a short String followed by another
+;                String reaches C as a dangling pointer, aura#4554);
 ;                #f on any failure, nothing half-loaded is returned
 ;   nmod:swap!   hot-swap the implementation behind a cell at a safe point
 ;                the caller picked: gate the candidate (caller's randomized
@@ -22,7 +24,7 @@
 ; ("S" byte string = String + length, "I" Int; ret "S" or "I"). A String
 ; result is copied by c-func (strlen): NULL arrives as 0.
 ; Every .so has its own statics, so two loaded versions never share state.
-(export nmod:build! nmod:load nmod:fn nmod:name nmod:version nmod:so nmod:cell nmod:module nmod:state nmod:prev
+(export nmod:max-string-args nmod:build! nmod:load nmod:fn nmod:name nmod:version nmod:so nmod:cell nmod:module nmod:state nmod:prev
         nmod:swap! nmod:rollback!)
 (require "csink" all:)
 (require "plant" all:)
@@ -33,14 +35,17 @@
 (define (nm-env k d) (let ((v (getenv k))) (if (and (string? v) (> (string-length v) 0)) v d)))
 
 ; csrc: path to the module source; tag: file-name tag; cflags: extra C flags
-; (e.g. "-DRKN_IMPL_VERSION=2"); returns the .so path or #f (log next to it)
-(define (nmod:build! csrc tag cflags)
+; (e.g. "-DRKN_IMPL_VERSION=2"); deps: optional list of other files the
+; source includes (their contents go into the content address too);
+; returns the .so path or #f (log next to it)
+(define (nm-deps deps) (if (null? deps) "" (let ((t (read-file (car deps)))) (string-append (if (string? t) t "") "\n" (nm-deps (cdr deps))))))
+(define (nmod:build! csrc tag cflags . deps)
   (let ((src (read-file csrc)))
     (if (not (string? src)) #f
         (let* ((root (nm-env "SINK_ROOT" "."))
                (here (nm-env "SINK_DIR" root))
                (hdr (read-file (string-append here "/kernels/nmod.h")))
-               (key (string-append cflags "\n" src "\n" (if (string? hdr) hdr "")))
+               (key (string-append cflags "\n" src "\n" (if (string? hdr) hdr "") (if (null? deps) "" (nm-deps (car deps)))))
                (so (string-append root "/build/kernels/libnmod_" tag "_" (number->string (csink:hash key)) ".so")))
           (if (file-exists? so) so
               (begin
@@ -48,10 +53,12 @@
                                       here "/kernels/build_one.sh " csrc " " so " > " so ".log 2>&1"))
                 (if (file-exists? so) so #f)))))))
 
+(define (nm-count-s kinds) (if (null? kinds) 0 (+ (if (equal? (car kinds) "S") 1 0) (nm-count-s (cdr kinds)))))
+(define nmod:max-string-args 1)
 (define (nm-bind lib spec acc)
   (if (null? spec) (reverse acc)
       (let* ((s (car spec)) (kinds (car (cdr (cdr s)))) (ret (car (cdr (cdr (cdr s))))))
-        (if (> (csink:c-arity kinds) csink:max-c-args) #f
+        (if (or (> (csink:c-arity kinds) csink:max-c-args) (> (nm-count-s kinds) nmod:max-string-args)) #f
             (let ((f (try (c-func lib (car (cdr s)) (csink:sig kinds ret)) (catch (e) #f))))
               (if (procedure? f) (nm-bind lib (cdr spec) (cons (cons (car s) f) acc)) #f))))))
 
